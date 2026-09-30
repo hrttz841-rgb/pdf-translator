@@ -22,6 +22,50 @@ Scholar PDF Translator 因此把 PDF 翻译理解为一条完整的文献处理�
 
 项目的目标，是让研究者最终得到的不是一堆“已经翻译过的页面”，而是一份可以直接阅读、检索、批注、引用和继续编辑的中文学术文稿。
 
+
+## Before / After：为什么需要“书稿重建”
+
+下面两张是实际 PDF 翻译工作流中出现过的原始 AI 翻译结果。可以看到，问题往往已经不再是某一句“有没有翻译成中文”，而是**文档结构本身已经损坏**：下载源和馆藏元数据混入正文、版权信息与目录串在一起，中英文残留交错，章节层级不统一，原本可读的目录失去结构。
+
+### 常见的原始 AI / PDF 翻译结果
+
+**示例 1：元数据、版权页、目录与正文混杂**
+
+<p align="center">
+  <img src="assets/comparison/before-ai-raw-1.jpg" width="62%" alt="原始 AI 翻译结果：元数据、版权页和正文混杂">
+</p>
+
+**示例 2：目录只完成局部翻译，章节层级和语言混排**
+
+<p align="center">
+  <img src="assets/comparison/before-ai-raw-2.jpg" width="62%" alt="原始 AI 翻译结果：目录中英文混排、层级混乱">
+</p>
+
+Scholar PDF Translator 增加的核心步骤，是在翻译之后继续进行**结构识别、内容清洗、目录重建、章节层级恢复、引文处理和正式书稿排版**。同一类长篇学术文献可以被重新组织成更接近中文图书的连续稿件。
+
+### 经过书稿重建后的输出
+
+**书名页**
+
+<p align="center">
+  <img src="assets/comparison/after-cover.jpg" width="48%" alt="Scholar PDF Translator 重建后的中文书名页">
+</p>
+
+**自动重建的中文目录**
+
+<p align="center">
+  <img src="assets/comparison/after-toc.jpg" width="48%" alt="Scholar PDF Translator 重建后的中文目录">
+</p>
+
+**重新排版的正文 / 前言**
+
+<p align="center">
+  <img src="assets/comparison/after-preface.jpg" width="48%" alt="Scholar PDF Translator 重建后的中文前言">
+</p>
+
+> 这些截图用于展示“原始机器翻译输出”与“结构化中文书稿重建”之间的差异。不同 PDF 的 OCR 质量、原始版式和模型表现会有所不同，因此这里展示的是实际工作流示例，而不是对所有 AI 翻译产品效果的统一判断。
+
+
 ## 为什么做这个项目
 
 对于需要长期阅读外文学术文献的人来说，PDF 翻译通常不是一个简单的语言问题，而是一个“文档理解 + 翻译 + 编辑 + 排版”的复合任务。
