@@ -414,3 +414,56 @@ def test_pdfjs_cmaps_and_fonts_are_served(srv):
     ):
         r, data = request(srv, "GET", path, token=False)
         assert r.status == 200 and len(data) > 100, path
+
+
+@pytest.mark.parametrize(
+    "provider,reply",
+    [
+        (
+            "openai",
+            {
+                "choices": [
+                    {"message": {"content": '{"blocks":['}, "finish_reason": "length"}
+                ]
+            },
+        ),
+        (
+            "anthropic",
+            {
+                "content": [{"type": "text", "text": '{"blocks":['}],
+                "stop_reason": "max_tokens",
+            },
+        ),
+        (
+            "gemini",
+            {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": '{"blocks":['}]},
+                        "finishReason": "MAX_TOKENS",
+                    }
+                ]
+            },
+        ),
+    ],
+)
+def test_truncated_output_is_reported(monkeypatch, provider, reply):
+    monkeypatch.setattr(ai_client, "_post_json", lambda *a: reply)
+    out = server.call_ai_result(
+        {"provider": provider, "api_key": "k", "text": "x", "task": "reconstruct"}
+    )
+    assert out["truncated"] is True
+
+
+def test_process_endpoint_returns_truncated_flag(srv, monkeypatch):
+    monkeypatch.setattr(
+        ai_client,
+        "_post_json",
+        lambda *a: {
+            "choices": [{"message": {"content": "{"}, "finish_reason": "length"}]
+        },
+    )
+    r, data = request(
+        srv, "POST", "/api/process", {"provider": "openai", "api_key": "k", "text": "x"}
+    )
+    assert r.status == 200 and json.loads(data) == {"text": "{", "truncated": True}

@@ -25,7 +25,7 @@ from keystore import (
     forget_key_base,
     allowed_base_for_stored_key,
 )
-from ai_client import call_ai, system_prompt  # noqa: F401
+from ai_client import call_ai, call_ai_result, system_prompt  # noqa: F401
 from docx_export import (  # noqa: F401
     build_translation_docx,
     build_manuscript_docx,
@@ -221,8 +221,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 raise ValueError("请求格式错误")
             if self.path == "/api/process":
-                text = call_ai(data)
-                self.json_response({"text": text})
+                self.json_response(call_ai_result(data))
                 return
             if self.path == "/api/export-docx":
                 mode = data.get("mode", "translated")

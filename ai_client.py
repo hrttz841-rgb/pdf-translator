@@ -215,6 +215,11 @@ def system_prompt(data):
 
 
 def call_ai(data):
+    return call_ai_result(data)["text"]
+
+
+def call_ai_result(data):
+    """调用 AI 接口，返回 {"text": 文本, "truncated": 是否因达到输出长度上限而被截断}。"""
     provider = normalize_provider(data.get("provider"))
     info = provider_info(provider)
     label = info["label"]
@@ -251,7 +256,7 @@ def call_ai(data):
         ).strip()
         if not text:
             raise RuntimeError(f"{label} 返回中没有可用文本")
-        return text
+        return {"text": text, "truncated": obj.get("stop_reason") == "max_tokens"}
     if kind == "gemini":
         url = _join_url(base, f"/models/{model}:generateContent")
         payload = {
@@ -271,7 +276,10 @@ def call_ai(data):
         ).strip()
         if not text:
             raise RuntimeError(f"{label} 返回中没有可用文本")
-        return text
+        return {
+            "text": text,
+            "truncated": candidates[0].get("finishReason") == "MAX_TOKENS",
+        }
     url = _join_url(base, "/chat/completions")
     payload = {
         "model": model,
@@ -284,7 +292,11 @@ def call_ai(data):
     }
     obj = _post_json(url, {"Authorization": "Bearer " + api_key}, payload, label)
     try:
-        return (obj["choices"][0]["message"]["content"] or "").strip()
+        choice = obj["choices"][0]
+        return {
+            "text": (choice["message"]["content"] or "").strip(),
+            "truncated": choice.get("finish_reason") == "length",
+        }
     except Exception:
         raise RuntimeError(
             f"{label} 返回中没有 choices[0].message.content：{json.dumps(obj,ensure_ascii=False)[:900]}"

@@ -812,6 +812,9 @@ async function deleteKey() {
   await refreshKeyStatus();
 }
 async function apiCall(task, text, context = "", source = "") {
+  return (await apiCallResult(task, text, context, source)).text;
+}
+async function apiCallResult(task, text, context = "", source = "") {
   const body = {
     provider: providerName(),
     api_key: $("apiKey").value.trim(),
@@ -838,7 +841,7 @@ async function apiCall(task, text, context = "", source = "") {
     data = JSON.parse(raw);
   } catch (e) {}
   if (!r.ok) throw new Error(data.error || raw || `HTTP ${r.status}`);
-  return data.text;
+  return { text: data.text || "", truncated: !!data.truncated };
 }
 function prevContext(idx) {
   const n = +$("contextChars").value || 0;
@@ -1216,6 +1219,84 @@ function normalizeManuscriptBlocks(blocks) {
   }
   return out;
 }
+function headingContext(blocks) {
+  return blocks
+    .slice(-8)
+    .filter((b) =>
+      ["part", "chapter", "section", "subsection", "preface_title"].includes(
+        b.type,
+      ),
+    )
+    .map((b) => `${b.type}: ${b.text}`)
+    .join("\n")
+    .slice(-1800);
+}
+function pageRange(group) {
+  const a = group[0].n,
+    b = group[group.length - 1].n;
+  return a === b ? `第 ${a} 页` : `第 ${a}-${b} 页`;
+}
+// 重建一批页面。模型输出被截断或 JSON 不完整时，把这批页面对半拆开重试；
+// 单页仍然失败时先重试一次，再退回为按段落的正文块，保证内容不丢失。
+async function reconstructGroup(group, context, job, retried = false) {
+  const unitLabel = state.pdf ? "PDF PAGE" : "IMPORTED TEXT UNIT";
+  const text = group
+    .map((p) => `=== ${unitLabel} ${p.n} ===\n${prefilterBookText(p.target)}`)
+    .join("\n\n");
+  const sourceText = group.some(
+    (p) => p.source && p.source.trim() && p.source.trim() !== p.target.trim(),
+  )
+    ? group
+        .map(
+          (p) =>
+            `=== ${unitLabel} ${p.n} ORIGINAL ===\n${prefilterBookText(p.source).slice(0, 3200)}`,
+        )
+        .join("\n\n")
+        .slice(0, 18000)
+    : "";
+  status(`书稿结构重建：${pageRange(group)}…`);
+  const res = await apiCallResult("reconstruct", text, context, sourceText);
+  let obj = null;
+  if (!res.truncated) {
+    try {
+      obj = parseModelJson(res.text);
+    } catch (e) {}
+  }
+  if (obj && Array.isArray(obj.blocks)) {
+    job.done += group.length;
+    progress(job.done, job.total, "AI 书稿重建");
+    return normalizeManuscriptBlocks(obj.blocks);
+  }
+  const why = res.truncated ? "超出模型单次输出长度" : "返回的结构数据不完整";
+  if (group.length > 1) {
+    log(`${pageRange(group)}${why}，自动拆成更小的批次重试。`);
+    const mid = Math.ceil(group.length / 2);
+    if (res.truncated) job.batch = Math.min(job.batch, mid);
+    const first = await reconstructGroup(group.slice(0, mid), context, job);
+    const second = await reconstructGroup(
+      group.slice(mid),
+      headingContext(first) || context,
+      job,
+    );
+    return [...first, ...second];
+  }
+  if (!retried && !res.truncated) {
+    log(`${pageRange(group)}${why}，重试一次。`);
+    return reconstructGroup(group, context, job, true);
+  }
+  const p = group[0];
+  job.fallbackPages.push(p.n);
+  job.done += 1;
+  progress(job.done, job.total, "AI 书稿重建");
+  log(`${pageRange(group)}${why}，改为按段落保留为正文。`);
+  return splitParas(prefilterBookText(p.target)).map((t) => ({
+    type: "body",
+    text: t,
+    page: p.n,
+    level: 0,
+    confidence: 0.3,
+  }));
+}
 async function reconstructBook(force = false) {
   syncEditors();
   if (state.manuscript && !force) return state.manuscript;
@@ -1228,68 +1309,32 @@ async function reconstructBook(force = false) {
   $("reconstructBtn").textContent = "正在重建…";
   try {
     const batch = Math.max(2, +$("manuscriptBatchPages").value || 6),
+      pages = state.pages.filter((p) => p.target && p.target.trim()),
       all = [];
+    // 批次大小会随截断情况自动缩小，后续批次沿用较小的批次，避免反复浪费调用
+    const job = { done: 0, total: pages.length, fallbackPages: [], batch };
     let context = "";
-    for (let start = 0; start < state.pages.length; start += batch) {
-      const group = state.pages
-        .slice(start, start + batch)
-        .filter((p) => p.target && p.target.trim());
-      if (!group.length) continue;
-      const unitLabel = state.pdf ? "PDF PAGE" : "IMPORTED TEXT UNIT";
-      const text = group
-        .map(
-          (p) => `=== ${unitLabel} ${p.n} ===\n${prefilterBookText(p.target)}`,
-        )
-        .join("\n\n");
-      const sourceText = group.some(
-        (p) =>
-          p.source && p.source.trim() && p.source.trim() !== p.target.trim(),
-      )
-        ? group
-            .map(
-              (p) =>
-                `=== ${unitLabel} ${p.n} ORIGINAL ===\n${prefilterBookText(p.source).slice(0, 3200)}`,
-            )
-            .join("\n\n")
-            .slice(0, 18000)
-        : "";
-      status(`书稿结构重建：第 ${group[0].n}-${group[group.length - 1].n} 页…`);
-      const raw = await apiCall("reconstruct", text, context, sourceText);
-      let obj;
-      try {
-        obj = parseModelJson(raw);
-      } catch (e) {
-        throw new Error(
-          `第 ${group[0].n}-${group[group.length - 1].n} 页的书稿结构 JSON 无法解析，请重试。模型返回开头：${raw.slice(0, 220)}`,
-        );
-      }
-      const blocks = normalizeManuscriptBlocks(obj.blocks);
-      all.push(...blocks);
-      context = all
-        .slice(-8)
-        .filter((b) =>
-          [
-            "part",
-            "chapter",
-            "section",
-            "subsection",
-            "preface_title",
-          ].includes(b.type),
-        )
-        .map((b) => `${b.type}: ${b.text}`)
-        .join("\n")
-        .slice(-1800);
-      progress(
-        Math.min(start + batch, state.pages.length),
-        state.pages.length,
-        "AI 书稿重建",
+    for (let start = 0; start < pages.length;) {
+      const size = job.batch;
+      const blocks = await reconstructGroup(
+        pages.slice(start, start + size),
+        context,
+        job,
       );
+      all.push(...blocks);
+      context = headingContext(all) || context;
+      start += size;
     }
     state.manuscript = {
       version: 2,
       createdAt: new Date().toISOString(),
       blocks: normalizeManuscriptBlocks(all),
+      fallbackPages: job.fallbackPages,
     };
+    if (job.fallbackPages.length)
+      log(
+        `第 ${job.fallbackPages.join("、")} 页未能识别结构，已按正文段落保留全部内容。`,
+      );
     if (!state.manuscript.blocks.length)
       throw new Error("没有得到有效书稿结构");
     const noteBlocks = state.manuscript.blocks.filter(
@@ -1748,7 +1793,11 @@ function openPreview() {
             "",
           )}${arr.length > 30 ? `<li>…另有 ${arr.length - 30} 条</li>` : ""}</ul>`
       : "";
+  const fb = state.manuscript?.fallbackPages || [];
   $("previewNotes").innerHTML =
+    (fb.length
+      ? `<p class="warn-text">第 ${fb.join("、")} 页未能识别结构，已按正文段落保留，这些页中的标题和注释不会单独排版。</p>`
+      : "") +
     (anchors.size || notes.size
       ? `<p>${matched.length} 个注号找到了对应注释${$("trueFootnotes").checked ? "，导出时转为 Word 页下注" : ""}。</p>`
       : "<p>没有识别到注释。</p>") +
