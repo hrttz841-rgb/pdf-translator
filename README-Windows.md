@@ -1,4 +1,4 @@
-# Scholar PDF Translator v2.6
+# Scholar PDF Translator v2.7
 
 面向学术论文、报告和扫描图书的本地 PDF 翻译与中文书稿重建工具。
 
@@ -37,6 +37,8 @@ PDF → 文本层/按需 OCR → 版面和单双栏识别 → 清洗 → 翻译 
 
 ## 隐私
 
-PDF 解析与 OCR 主要在浏览器本地完成。需要 AI 的翻译、校对与书稿重建文本会发送给用户自行选择的 API 平台。
+PDF 解析与 OCR 在浏览器本地完成，所需的 pdf.js、Tesseract.js 和常用 OCR 语言数据随程序分发，可以离线运行。需要 AI 的翻译、校对与书稿重建文本会发送给用户自行选择的 API 平台。
 
 Windows 的 Key 使用 DPAPI 加密后保存，仅当前 Windows 用户可解密。
+
+本地服务只接受本工具自己页面发出的请求，已保存的 Key 只会发送到保存时登记的 API 地址。

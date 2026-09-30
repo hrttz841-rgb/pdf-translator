@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
 $BasePort = 8765
-$ExpectedVersion = '2.6.0'
+$ExpectedVersion = '2.7.0'
 $PidFile = Join-Path $PSScriptRoot '.pdf_translator.pid'
 $PortFile = Join-Path $PSScriptRoot '.pdf_translator.port'
 $LogFile = Join-Path $PSScriptRoot 'pdf-translator.log'
@@ -90,7 +90,7 @@ $checkArgs = @() + $pythonPrefix + @('-c','import docx')
 & $pythonExe @checkArgs 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host '正在安装 Word 导出组件 python-docx（仅首次需要）...'
-    $pipArgs = @() + $pythonPrefix + @('-m','pip','install','--user','python-docx')
+    $pipArgs = @() + $pythonPrefix + @('-m','pip','install','--user','python-docx>=1.1,<2')
     & $pythonExe @pipArgs *>> $LogFile
     if ($LASTEXITCODE -ne 0) {
         Write-Host "python-docx 安装失败，请查看：$LogFile" -ForegroundColor Red

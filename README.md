@@ -1,8 +1,10 @@
-# Scholar PDF Translator v2.6
+# Scholar PDF Translator v2.7
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Created and maintained by Yifei Liu.**
+
+[English README](README.en.md)
 
 Scholar PDF Translator 是一个面向学术研究、专业阅读和长篇文献处理的本地 PDF 翻译与中文书稿重建工具。它试图解决一个在现有 AI 翻译工作流中经常被忽视的问题：**真正影响学术阅读效率的，不只是“能不能把句子翻译出来”，还包括能不能正确理解一本书或一篇论文的结构，并把翻译结果重新组织成一份可持续阅读、引用、校对和编辑的正式文稿。**
 
@@ -190,6 +192,14 @@ Scholar PDF Translator 增加的核心步骤，是在翻译之后继续进行**�
 
 中文书稿会重新分页，而不是机械继承原 PDF 的页界。
 
+## 界面预览
+
+<p align="center">
+  <img src="ui-overview.png" width="90%" alt="Scholar PDF Translator 工作界面：左侧为文档与模型设置，中间为原文版面，右侧为译文">
+</p>
+
+左侧设置文档、模型和翻译风格，中间显示原文页面及识别出的文本块，右侧为可直接编辑的译文。
+
 ## 支持的 AI 平台
 
 - DeepSeek
@@ -201,7 +211,7 @@ Scholar PDF Translator 增加的核心步骤，是在翻译之后继续进行**�
 - OpenRouter
 - 任意 OpenAI-compatible 自定义接口
 
-模型 ID 均可手动修改，因此也可以使用各平台后续推出的新模型。
+模型 ID 均可手动修改，因此也可以使用各平台后续推出的新模型。各平台预设的模型 ID 只是默认值，平台会不断推出和下线模型，请以对应平台的最新文档和自己账户中可用的模型为准。
 
 API Key 按平台分别保存在系统安全凭据存储中：
 
@@ -262,6 +272,19 @@ AI 书稿重建
 
 `停止翻译工具.bat`
 
+## Linux 及手动运行
+
+Linux 没有提供双击启动脚本，可以在项目目录中运行：
+
+```bash
+python3 -m pip install --user -r requirements.txt
+python3 server.py
+```
+
+然后在浏览器中打开终端显示的地址（默认 `http://127.0.0.1:8765`）。需要换端口时，设置环境变量 `PDF_TRANSLATOR_PORT`。Linux 下的 API Key 保存在 `~/.scholar_pdf_translator/` 中仅当前用户可读的文件里。
+
+请始终通过启动脚本或上面的地址打开页面，直接双击 `index.html` 以文件方式打开时无法调用本地服务。
+
 ## 已有译文直接重建
 
 如果已经完成翻译，不需要重新调用模型翻译整本书。
@@ -281,9 +304,15 @@ AI 书稿重建
 
 ## 隐私与数据
 
-PDF 解析和 OCR 尽可能在浏览器本地完成。
+PDF 解析和 OCR 在浏览器本地完成。pdf.js、Tesseract.js 及英文、简体中文、日文的 OCR 语言数据都随仓库分发（见 `vendor/`），因此这两个环节可以离线运行；只有在本地副本缺失，或选择了未随附的 OCR 语言时，才会从 CDN 下载。
 
 只有需要 AI 处理的文本内容，例如翻译、校对和书稿结构重建，会发送到用户自己选择并配置的模型 API。项目本身不内置公共 API Key，也不会把用户的 Key 提交到仓库。
+
+本地服务只监听 `127.0.0.1`，并做了以下防护，避免浏览器中打开的其他网页冒用本地服务：
+
+- 不开放跨域访问，并校验请求的 Host 与 Origin，可以防御 DNS 重绑定；
+- 每次启动随机生成会话令牌，只注入到本工具自己的页面中，所有接口调用都必须携带；
+- 已保存的 Key 只会发送到保存时登记的 API 地址（或该平台的默认地址）。改用其他地址时，需要在设置中重新输入并保存 Key。
 
 ## 项目定位
 
@@ -293,6 +322,29 @@ Scholar PDF Translator 目前仍然是一个持续迭代中的研究型工具。
 
 如果这个工具能够让研究者少花几个小时整理页眉页脚、修复段落、寻找注释、重做目录，而把更多时间用在真正的阅读、理解和研究上，那么这个项目就已经达到了它最重要的目的。
 
+
+## 开发与测试
+
+项目结构：
+
+| 文件 | 作用 |
+| --- | --- |
+| `index.html`、`app.js`、`styles.css` | 浏览器端界面、PDF 解析、OCR 与流程控制 |
+| `server.py` | 本地 HTTP 服务入口与访问控制 |
+| `providers.py` | 各 AI 平台的默认配置 |
+| `keystore.py` | API Key 的系统凭据存储与发送地址登记 |
+| `ai_client.py` | 各任务的提示词与 AI 接口调用 |
+| `docx_export.py` | 分段重排、Word 书稿与对照稿导出、Word 导入 |
+| `vendor/` | pdf.js 与 Tesseract.js 的本地副本 |
+
+运行测试：
+
+```bash
+python3 -m pip install -r requirements.txt pytest
+python3 -m pytest
+```
+
+测试覆盖接口访问控制、Key 的发送范围、Word 导出与导入以及各任务的提示词。每次推送后 GitHub Actions 会在 Linux、macOS 和 Windows 上自动运行。
 
 ## Contributors
 

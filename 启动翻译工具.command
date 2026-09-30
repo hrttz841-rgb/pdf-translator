@@ -4,7 +4,7 @@ set -u
 cd "$(dirname "$0")" || exit 1
 
 BASE_PORT=8765
-EXPECTED_VERSION="2.6.0"
+EXPECTED_VERSION="2.7.0"
 PID_FILE=".pdf_translator.pid"
 PORT_FILE=".pdf_translator.port"
 LOG_FILE="pdf-translator.log"
@@ -109,9 +109,9 @@ fi
 # Word 导出依赖：只在缺失时安装一次。
 if ! "$PYTHON" -c "import docx" >/dev/null 2>&1; then
   echo "正在安装 Word 导出组件 python-docx（仅首次需要）..."
-  if ! "$PYTHON" -m pip install --user python-docx >> "$LOG_FILE" 2>&1; then
+  if ! "$PYTHON" -m pip install --user "python-docx>=1.1,<2" >> "$LOG_FILE" 2>&1; then
     # Homebrew Python 可能启用 PEP 668；仅在 --user 失败时使用该兼容参数。
-    "$PYTHON" -m pip install --user --break-system-packages python-docx >> "$LOG_FILE" 2>&1 || {
+    "$PYTHON" -m pip install --user --break-system-packages "python-docx>=1.1,<2" >> "$LOG_FILE" 2>&1 || {
       echo "python-docx 安装失败。请查看 $LOG_FILE。"
       read -r -p "按回车键关闭窗口..."
       exit 1
