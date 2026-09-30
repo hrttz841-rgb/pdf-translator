@@ -467,3 +467,39 @@ def test_process_endpoint_returns_truncated_flag(srv, monkeypatch):
         srv, "POST", "/api/process", {"provider": "openai", "api_key": "k", "text": "x"}
     )
     assert r.status == 200 and json.loads(data) == {"text": "{", "truncated": True}
+
+
+def _docx_bytes(pages, page_breaks=True):
+    from docx import Document
+    from docx.enum.text import WD_BREAK
+
+    doc = Document()
+    for i, paras in enumerate(pages):
+        for j, t in enumerate(paras):
+            p = doc.add_paragraph(t)
+            if page_breaks and i < len(pages) - 1 and j == len(paras) - 1:
+                p.add_run().add_break(WD_BREAK.PAGE)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def test_import_docx_splits_on_page_breaks():
+    pages = [[f"第{i}页第一段。", f"第{i}页第二段。"] for i in range(1, 145)]
+    out = server.import_docx_bytes(_docx_bytes(pages))
+    assert out["unit"] == "page"
+    assert len(out["pages"]) == 144
+    assert out["pages"][9]["target"] == "第10页第一段。\n\n第10页第二段。"
+
+
+def test_import_docx_without_page_info_uses_page_sized_units():
+    para = "这是一个用于测试的中文段落，长度大约相当于书中的一个自然段。" * 6
+    pages = [[para] * 40]
+    out = server.import_docx_bytes(_docx_bytes(pages, page_breaks=False))
+    assert out["unit"] == "chunk"
+    assert len(out["pages"]) >= 4
+    for p in out["pages"]:
+        assert len(p["target"]) <= 1900
+        # 段落边界保留：每个段落完整出现，没有被按句子拆开
+        for piece in p["target"].split("\n\n"):
+            assert piece == para

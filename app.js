@@ -204,7 +204,7 @@ function importedPage(n, source = "", target = "") {
     errorStage: "",
   };
 }
-function activateImportedProject(name, pages, kind) {
+function activateImportedProject(name, pages, kind, unit = "chunk") {
   if (!pages?.length) throw new Error("没有识别到可导入的译文内容");
   state.pdf = null;
   state.fileName = name || "已有译文";
@@ -219,10 +219,13 @@ function activateImportedProject(name, pages, kind) {
     state.fileName,
     state.pages.length,
     kind === "bilingual" ? "双语译文" : "译文",
+    unit,
   );
   selectView("text");
   status(
-    `已导入已有${kind === "bilingual" ? "双语" : "中文译文"} · ${state.pages.length} 个文本单元，可直接 AI 书稿重建`,
+    unit === "page"
+      ? `已导入${kind === "bilingual" ? "双语" : "中文"}译文，共 ${state.pages.length} 页，可以直接进行书稿重建。`
+      : `已导入${kind === "bilingual" ? "双语" : "中文"}译文。文件中没有分页信息，已按约一页的长度分为 ${state.pages.length} 个单元，可以直接进行书稿重建。`,
   );
   log(
     `导入已有${kind === "bilingual" ? "双语" : "译文"}文件，跳过 OCR 与翻译。`,
@@ -260,6 +263,7 @@ function htmlToImportedPages(html) {
       kind: pages.some((p) => p.source && p.target)
         ? "bilingual"
         : "translated",
+      unit: "page",
       pages,
     };
   }
@@ -271,7 +275,8 @@ function htmlToImportedPages(html) {
     .split(/\n{2,}/)
     .map((x) => x.trim())
     .filter(Boolean)) {
-    if (cur && cur.length + para.length > 7000) {
+    // 没有分页信息时每个单元约一页长，单元过长会让书稿重建超出模型单次输出长度
+    if (cur && cur.length + para.length > 1800) {
       chunks.push(cur);
       cur = "";
     }
@@ -280,6 +285,7 @@ function htmlToImportedPages(html) {
   if (cur) chunks.push(cur);
   return {
     kind: "translated",
+    unit: "chunk",
     pages: chunks.map((t, i) => ({ n: i + 1, source: "", target: t })),
   };
 }
@@ -290,7 +296,7 @@ async function importExisting(file) {
   status("正在导入已有译文…");
   if (ext === "html" || ext === "htm") {
     const obj = htmlToImportedPages(await file.text());
-    activateImportedProject(name, obj.pages, obj.kind);
+    activateImportedProject(name, obj.pages, obj.kind, obj.unit);
     return;
   }
   if (ext === "json") {
@@ -310,6 +316,7 @@ async function importExisting(file) {
         target: p.target || "",
       })),
       obj.pages.some((p) => p.source && p.target) ? "bilingual" : "translated",
+      "page",
     );
     if (obj.manuscript) state.manuscript = obj.manuscript;
     return;
@@ -328,7 +335,7 @@ async function importExisting(file) {
     });
     const obj = await r.json();
     if (!r.ok) throw new Error(obj.error || `HTTP ${r.status}`);
-    activateImportedProject(name, obj.pages, obj.kind);
+    activateImportedProject(name, obj.pages, obj.kind, obj.unit || "chunk");
     return;
   }
   throw new Error("暂不支持该文件格式");
@@ -1531,9 +1538,9 @@ function openModal(id) {
 function closeModal(id) {
   $(id).classList.remove("open");
 }
-function setDocument(name, count, kind) {
+function setDocument(name, count, kind, unit = "page") {
   $("docTitle").textContent =
-    `${name} · ${count} ${kind === "PDF" ? "页" : "个文本单元"}`;
+    `${name} · ${count} ${kind === "PDF" || unit === "page" ? "页" : "个单元（按长度切分）"}`;
   $("docTitle").title = name;
   $("fileInfo").hidden = false;
   $("fileInfo").textContent = `${kind}：${name}`;

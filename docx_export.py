@@ -891,28 +891,86 @@ def build_manuscript_docx(data):
     return content
 
 
-def _chunk_text_as_pages(text, max_chars=7000):
+# 没有分页信息时，每个导入单元大约相当于一页书稿；单元过长会让书稿重建超出模型的单次输出长度
+IMPORT_UNIT_CHARS = 1800
+
+
+def _split_long_paragraph(para, max_chars):
+    """超长段落按句末标点切开，句子本身超长时再硬切。"""
+    if len(para) <= max_chars:
+        return [para]
+    parts, cur = [], ""
+    for sent in re.split(r"(?<=[。！？!?；;.])\s*", para):
+        if not sent:
+            continue
+        while len(sent) > max_chars:
+            if cur:
+                parts.append(cur)
+                cur = ""
+            parts.append(sent[:max_chars])
+            sent = sent[max_chars:]
+        if cur and len(cur) + len(sent) > max_chars:
+            parts.append(cur)
+            cur = sent
+        else:
+            cur += sent
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+def _chunk_text_as_pages(text, max_chars=IMPORT_UNIT_CHARS):
+    """按段落把连续文本分成约一页长的单元，保留段落边界。"""
     text = (text or "").strip()
     if not text:
         return []
-    paras = [
-        x.strip()
-        for x in re.split(r"\n\s*\n|(?<=。)\s*(?=[一-龥A-Za-z])", text)
-        if x.strip()
-    ]
-    pages = []
-    cur = []
-    n = 0
+    paras = [x.strip() for x in re.split(r"\n\s*\n", text) if x.strip()]
+    pages, cur, n = [], [], 0
     for para in paras:
-        if cur and n + len(para) > max_chars:
-            pages.append("\n\n".join(cur))
-            cur = []
-            n = 0
-        cur.append(para)
-        n += len(para) + 2
+        for piece in _split_long_paragraph(para, max_chars):
+            if cur and n + len(piece) > max_chars:
+                pages.append("\n\n".join(cur))
+                cur, n = [], 0
+            cur.append(piece)
+            n += len(piece) + 2
     if cur:
         pages.append("\n\n".join(cur))
     return pages
+
+
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _paragraph_segments(paragraph):
+    """把段落按其中的分页位置切开。
+
+    返回 (段前是否分页, 文字片段列表)。片段之间各隔一个分页；分页来源包括手动分页符、
+    段前分页属性，以及 Word 保存时记录的排版分页（lastRenderedPageBreak）。
+    """
+    el = paragraph._p
+    before = False
+    ppr = el.find(_W + "pPr")
+    if ppr is not None:
+        pb = ppr.find(_W + "pageBreakBefore")
+        if pb is not None and pb.get(_W + "val") in (None, "1", "true", "on"):
+            before = True
+    segments, cur = [], []
+    for node in el.iter():
+        tag = node.tag
+        if tag == _W + "t" and node.text:
+            cur.append(node.text)
+        elif tag == _W + "tab":
+            cur.append("\t")
+        elif (
+            tag == _W + "br" and node.get(_W + "type") == "page"
+        ) or tag == _W + "lastRenderedPageBreak":
+            if "".join(cur).strip() or segments:
+                segments.append("".join(cur))
+                cur = []
+            else:
+                before = True
+    segments.append("".join(cur))
+    return before, segments
 
 
 def import_docx_bytes(blob):
@@ -973,29 +1031,48 @@ def import_docx_bytes(blob):
                 continue
             src.append(a)
             tgt.append(b)
-            if sum(map(len, src)) + sum(map(len, tgt)) > 12000:
+            if sum(map(len, src)) + sum(map(len, tgt)) > IMPORT_UNIT_CHARS * 2:
                 flush()
         flush()
         if any(p["target"] for p in pages):
             return {"kind": "bilingual", "pages": pages}
-    # Otherwise import the readable document body as an already translated manuscript.
-    body = []
+    # 否则把正文作为已完成的译文导入：优先按 Word 中记录的分页切分，没有分页信息时按约一页的长度切分
+    page_texts, cur = [], []
+    breaks = 0
+
+    def add(text):
+        t = text.strip()
+        if t and not re.fullmatch(r"原\s*PDF\s*第\s*\d+\s*页", t, re.I):
+            cur.append(t)
+
     for p in doc.paragraphs:
-        t = p.text.strip()
-        if not t:
-            body.append("")
-            continue
-        # Drop the app's own mechanical title/marker lines; AI reconstruction will rebuild hierarchy.
-        if re.fullmatch(r"原\s*PDF\s*第\s*\d+\s*页", t, re.I):
-            continue
-        body.append(t)
-    text = "\n\n".join(x for x in body if x != "").strip()
-    if not text:
+        before, segments = _paragraph_segments(p)
+        if before and cur:
+            page_texts.append(cur)
+            cur = []
+            breaks += 1
+        add(segments[0])
+        for seg in segments[1:]:
+            if cur:
+                page_texts.append(cur)
+                cur = []
+                breaks += 1
+            add(seg)
+    if cur:
+        page_texts.append(cur)
+    page_texts = [pg for pg in page_texts if pg]
+    if not page_texts:
         raise ValueError("Word 中没有读取到可导入的正文或双语对照表。")
-    chunks = _chunk_text_as_pages(text)
+    if breaks >= 2 and len(page_texts) >= 2:
+        units = []
+        for pg in page_texts:
+            units.extend(_chunk_text_as_pages("\n\n".join(pg), IMPORT_UNIT_CHARS * 3))
+        unit = "page"
+    else:
+        units = _chunk_text_as_pages("\n\n".join(t for pg in page_texts for t in pg))
+        unit = "chunk"
     return {
         "kind": "translated",
-        "pages": [
-            {"n": i + 1, "source": "", "target": t} for i, t in enumerate(chunks)
-        ],
+        "unit": unit,
+        "pages": [{"n": i + 1, "source": "", "target": t} for i, t in enumerate(units)],
     }
