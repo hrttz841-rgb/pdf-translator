@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json, os, urllib.request, urllib.error, urllib.parse, subprocess, platform, ssl, io, re, base64
+import hmac, secrets
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -7,7 +8,12 @@ ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PDF_TRANSLATOR_PORT", "8765"))
 APP_ID = "scholar-pdf-translator"
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.7.0"
+# 每次启动随机生成的会话令牌。只注入到本服务提供的页面中，其他网站无法读取，
+# 因而无法冒用本地服务调用 AI 接口或管理已保存的 API Key。
+SESSION_TOKEN = secrets.token_urlsafe(32)
+TOKEN_HEADER = "X-SPT-Token"
+MAX_BODY_BYTES = 90 * 1024 * 1024
 PROVIDERS = {
     "deepseek": {
         "label": "DeepSeek",
@@ -267,6 +273,79 @@ def delete_saved_api_key(provider="deepseek"):
             target.unlink()
 
 
+def _key_bases_file():
+    return KEY_DIR / "key_bases.json"
+
+
+def _read_key_bases():
+    try:
+        return json.loads(_key_bases_file().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _normalize_base(base):
+    return (base or "").strip().rstrip("/")
+
+
+def record_key_base(provider, base):
+    """登记已保存 Key 允许发送到的 API 地址（地址本身不是机密，以普通 JSON 保存）。"""
+    provider = normalize_provider(provider)
+    bases = _read_key_bases()
+    base = _normalize_base(base) or _normalize_base(provider_info(provider).get("base"))
+    if base:
+        bases[provider] = base
+    else:
+        bases.pop(provider, None)
+    _key_bases_file().parent.mkdir(parents=True, exist_ok=True)
+    _key_bases_file().write_text(
+        json.dumps(bases, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def forget_key_base(provider):
+    bases = _read_key_bases()
+    if bases.pop(normalize_provider(provider), None) is not None:
+        _key_bases_file().write_text(
+            json.dumps(bases, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+
+def allowed_base_for_stored_key(provider):
+    provider = normalize_provider(provider)
+    return _normalize_base(_read_key_bases().get(provider)) or _normalize_base(
+        provider_info(provider).get("base")
+    )
+
+
+def resolve_api_key(data, provider, base):
+    """返回本次请求使用的 Key。
+
+    请求中直接携带的 Key 可发往任意地址（用户正在界面中手动填写）；
+    已保存的 Key 与环境变量中的 Key 只能发往登记地址，防止被改写 API Base 后转发到第三方服务器。
+    """
+    info = provider_info(provider)
+    label = info["label"]
+    typed = (data.get("api_key") or "").strip()
+    if typed:
+        return typed
+    env_key = os.environ.get(info.get("env", ""), "") if info.get("env") else ""
+    stored = (env_key or load_saved_api_key(provider) or "").strip()
+    if not stored:
+        raise ValueError(f"缺少 {label} API Key")
+    allowed = allowed_base_for_stored_key(provider)
+    if not allowed:
+        # 自定义平台且尚未登记地址（例如旧版本保存的 Key）：首次使用时登记
+        record_key_base(provider, base)
+        allowed = _normalize_base(base)
+    if _normalize_base(base) != allowed:
+        raise ValueError(
+            f"出于安全考虑，已保存的 {label} Key 只会发送到保存时登记的地址（{allowed or '未登记'}）。"
+            f"如需改用 {base}，请在设置中重新输入 Key 并保存。"
+        )
+    return stored
+
+
 def _system_curl():
     if platform.system() == "Windows":
         return "curl.exe"
@@ -369,20 +448,108 @@ def _user_prompt(data):
     return user
 
 
+LANG_NAMES = {
+    "auto": "原文语言（自动识别）",
+    "en": "英文",
+    "zh": "中文",
+    "zh-CN": "简体中文",
+    "ja": "日文",
+    "fr": "法文",
+    "de": "德文",
+}
+
+STYLE_RULES = {
+    "academic": "学术中文：准确、克制，术语前后一致，保留原文论证层次，不添加原文没有的解释。",
+    "formal": "正式书面语：表达通顺规范，忠实原意，适度调整语序以符合目标语言习惯。",
+    "literal": "偏直译：尽量贴近原文句式与用词，便于逐句对照，不做意译和润色。",
+}
+
+MANUSCRIPT_TYPES = (
+    "book_title, subtitle, author, copyright, dedication, epigraph, preface_title, "
+    "part, chapter, section, subsection, body, blockquote, footnote, figure_caption, "
+    "table_caption, bibliography, appendix, toc_entry, discard"
+)
+
+
+def _glossary_rules(data):
+    lines = []
+    for raw in (data.get("glossary") or "").splitlines():
+        if "=" in raw:
+            a, b = raw.split("=", 1)
+            if a.strip() and b.strip():
+                lines.append(f"- {a.strip()} → {b.strip()}")
+    return ("\n术语表（必须严格遵守）：\n" + "\n".join(lines)) if lines else ""
+
+
+def system_prompt(data):
+    task = data.get("task", "translate")
+    src = LANG_NAMES.get(data.get("source_lang") or "auto", data.get("source_lang"))
+    tgt = LANG_NAMES.get(data.get("target_lang") or "zh-CN", data.get("target_lang"))
+    style = STYLE_RULES.get(data.get("style") or "academic", STYLE_RULES["academic"])
+    extra = (data.get("custom_prompt") or "").strip()
+    extra = f"\n用户额外要求：\n{extra}" if extra else ""
+    glossary = _glossary_rules(data)
+    if task == "ping":
+        return "这是连接测试。请只回复“连接正常”。"
+    if task == "translate":
+        return (
+            f"你是学术文献翻译专家，负责把{src}文本译为{tgt}。\n"
+            f"风格要求：{style}\n"
+            "规则：\n"
+            "- 只输出译文，不要解释、前言或总结，不要使用 Markdown 代码块。\n"
+            "- 保留段落划分；标题单独成段。\n"
+            "- 人名、机构名首次出现可在译名后括注原文。\n"
+            "- 数字、年份、比例、引文页码必须与原文一致。\n"
+            "- 脚注编号、上标注号保持原样；参考文献条目保留原文不译。\n"
+            "- 明显的 OCR 断行、连字符断词可直接修复，但不得删减内容。\n"
+            "- 提供的前文上下文只用于保持术语与衔接，不要重复翻译。"
+            f"{glossary}{extra}"
+        )
+    if task == "proofread":
+        return (
+            f"你是学术翻译校对编辑。请对照原文（{src}）检查{tgt}译文，并直接输出修订后的完整译文。\n"
+            f"风格要求：{style}\n"
+            "重点检查：漏译、误译、OCR 错误导致的误读、人名机构名与专有名词、数字年份与比例、段落遗漏、术语前后不一致。\n"
+            "只输出修订后的译文全文，不要列出修改说明，不要使用 Markdown 代码块；没有问题时原样输出译文。"
+            f"{glossary}{extra}"
+        )
+    if task == "audit":
+        return (
+            f"你是学术译稿的术语审校。下面是一份{tgt}译稿的节选，按 [P页码] 分隔。\n"
+            "请检查同一术语、人名、机构名在不同页中的译法是否一致，指出明显的前后矛盾和可疑译法。\n"
+            "输出简洁的中文清单：每条写明涉及的词、出现的不同译法及页码、建议统一的译法。没有发现问题时说明“未发现明显的术语不一致”。"
+            f"{glossary}"
+        )
+    if task == "reconstruct":
+        return (
+            "你是学术图书的编辑，负责把按页拼接的译文重建为结构化书稿。\n"
+            "输入按 === PDF PAGE n === 或 === IMPORTED TEXT UNIT n === 分隔；可能附带原文，只用于判断结构，不要重新翻译。\n"
+            "只输出一个 JSON 对象，不要任何说明文字，格式：\n"
+            '{"blocks":[{"type":"chapter","text":"……","page":1,"level":1,"confidence":0.9}]}\n'
+            f"type 只能取：{MANUSCRIPT_TYPES}。\n"
+            "规则：\n"
+            "- 按阅读顺序输出全部内容，正文不得删减或改写，只修复明显的断行和跨页断句；跨页被截断的段落合并为一个 body。\n"
+            "- level：part=1，chapter=1，section=2，subsection=3，其余为 0。\n"
+            "- 页眉、页脚、页码、馆藏章、扫描平台水印、条码、孤立乱码标为 discard 或直接省略。\n"
+            "- 原书目录页的条目标为 toc_entry（导出时会根据章节结构重新生成目录）。\n"
+            "- 注释：正文中的注号改写为 [[FN:作用域:编号]]，作用域用所在章的简短标识（如 ch1、intro），"
+            "注释条目输出为 type=footnote，并填写 note_id（编号）和 note_scope（同一作用域）；"
+            "章末注和书末注按其所属章节确定作用域，使注号与注释能够一一配对。\n"
+            "- 提供的前文结构上下文只用于保持章节层级连续，不要重复输出。"
+            f"{extra}"
+        )
+    return f"请按要求处理以下文本，输出结果即可。{extra}"
+
+
 def call_ai(data):
     provider = normalize_provider(data.get("provider"))
     info = provider_info(provider)
     label = info["label"]
-    env_key = os.environ.get(info.get("env", ""), "") if info.get("env") else ""
-    api_key = (
-        data.get("api_key") or env_key or load_saved_api_key(provider) or ""
-    ).strip()
-    if not api_key:
-        raise ValueError(f"缺少 {label} API Key")
     base = (data.get("api_base") or info.get("base") or "").rstrip("/")
     model = (data.get("model") or info.get("model") or "").strip()
     if not base:
         raise ValueError(f"{label} API Base 不能为空")
+    api_key = resolve_api_key(data, provider, base)
     if not model:
         raise ValueError(f"{label} 模型名称不能为空")
     system = system_prompt(data)
@@ -1465,21 +1632,56 @@ STATIC_MIME = {
 
 
 class Handler(BaseHTTPRequestHandler):
-    def cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    # 不发送任何 CORS 头：页面与接口同源，跨站网页既无法读取响应，也无法携带自定义令牌头。
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.cors()
-        self.end_headers()
+    def _allowed_hosts(self):
+        port = self.server.server_address[1]
+        return {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
+
+    def _host_ok(self):
+        # 校验 Host 头以防御 DNS 重绑定：恶意域名解析到 127.0.0.1 时 Host 仍是该域名
+        return (self.headers.get("Host") or "").lower() in self._allowed_hosts()
+
+    def _origin_ok(self):
+        origin = self.headers.get("Origin")
+        if origin and origin.lower() not in {
+            "http://" + h for h in self._allowed_hosts()
+        }:
+            return False
+        site = self.headers.get("Sec-Fetch-Site")
+        return site in (None, "same-origin", "none")
+
+    def _token_ok(self):
+        return hmac.compare_digest(self.headers.get(TOKEN_HEADER, ""), SESSION_TOKEN)
+
+    def _guard(self, api=False, needs_token=True):
+        if not self._host_ok():
+            self.send_error(403, "Invalid Host header")
+            return False
+        if api and not self._origin_ok():
+            self.json_response({"error": "拒绝跨站请求"}, 403)
+            return False
+        if api and needs_token and not self._token_ok():
+            self.json_response(
+                {
+                    "error": "会话令牌无效：请通过启动脚本打开的页面使用本工具，或刷新页面后重试"
+                },
+                403,
+            )
+            return False
+        return True
+
+    def _security_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
 
     def json_response(self, obj, status=200):
         out = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
-        self.cors()
+        self._security_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(out)))
         self.end_headers()
         self.wfile.write(out)
 
@@ -1487,60 +1689,116 @@ class Handler(BaseHTTPRequestHandler):
         self, content, content_type="application/octet-stream", status=200
     ):
         self.send_response(status)
-        self.cors()
+        self._security_headers()
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)
 
+    def _static_file(self, p):
+        if p == "/":
+            p = "/index.html"
+        rel = urllib.parse.unquote(p).lstrip("/")
+        f = (ROOT / rel).resolve()
+        try:
+            f.relative_to(ROOT)
+        except ValueError:
+            return None
+        if (
+            not f.is_file()
+            or f.suffix.lower() not in STATIC_MIME
+            or any(part.startswith(".") for part in f.relative_to(ROOT).parts)
+        ):
+            return None
+        return f
+
+    def _serve_static(self, p, head=False):
+        f = self._static_file(p)
+        if f is None:
+            self.send_error(404)
+            return
+        body = f.read_bytes()
+        if f.name == "index.html" and f.parent == ROOT:
+            meta = f'<meta name="spt-token" content="{SESSION_TOKEN}" />'
+            body = body.decode("utf-8").replace("</head>", meta + "\n</head>", 1)
+            body = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Cache-Control", "no-store" if f.suffix == ".html" else "no-cache"
+        )
+        self.send_header("Content-Type", STATIC_MIME[f.suffix.lower()])
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+
+    def do_HEAD(self):
+        if not self._guard():
+            return
+        p = self.path.split("?", 1)[0]
+        if p.startswith("/api/"):
+            self.send_error(405)
+            return
+        self._serve_static(p, head=True)
+
     def do_GET(self):
         p = self.path.split("?", 1)[0]
         if p == "/api/health":
+            # 启动脚本用来探测服务是否在运行，不含敏感信息
+            if not self._guard(api=True, needs_token=False):
+                return
             self.json_response(
                 {"ok": True, "app": APP_ID, "version": APP_VERSION, "port": PORT}
             )
             return
-        if p == "/api/key-status":
-            provider = normalize_provider(
-                urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get(
-                    "provider", ["deepseek"]
-                )[0]
-            )
-            key = load_saved_api_key(provider)
-            self.json_response(
-                {
-                    "saved": bool(key),
-                    "provider": provider,
-                    "storage": (
-                        "macOS Keychain"
-                        if platform.system() == "Darwin"
-                        else (
-                            "Windows DPAPI"
-                            if platform.system() == "Windows"
-                            else "local secure file"
-                        )
-                    ),
-                    "masked": ("••••" + key[-4:]) if key else "",
-                }
-            )
-            return
-        if p == "/":
-            p = "/index.html"
-        f = (ROOT / p.lstrip("/")).resolve()
-        if not str(f).startswith(str(ROOT)) or not f.is_file():
+        if p.startswith("/api/"):
+            if not self._guard(api=True):
+                return
+            if p == "/api/key-status":
+                provider = normalize_provider(
+                    urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get(
+                        "provider", ["deepseek"]
+                    )[0]
+                )
+                key = load_saved_api_key(provider)
+                self.json_response(
+                    {
+                        "saved": bool(key),
+                        "provider": provider,
+                        "storage": (
+                            "macOS Keychain"
+                            if platform.system() == "Darwin"
+                            else (
+                                "Windows DPAPI"
+                                if platform.system() == "Windows"
+                                else "local secure file"
+                            )
+                        ),
+                        "masked": ("••••" + key[-4:]) if key else "",
+                        "allowed_base": (
+                            allowed_base_for_stored_key(provider) if key else ""
+                        ),
+                    }
+                )
+                return
             self.send_error(404)
             return
-        mime = STATIC_MIME.get(f.suffix.lower(), "application/octet-stream")
-        self.send_response(200)
-        self.cors()
-        self.send_header("Content-Type", mime)
-        self.end_headers()
-        self.wfile.write(f.read_bytes())
+        if not self._guard():
+            return
+        self._serve_static(p)
 
     def do_POST(self):
+        if not self._guard(api=True):
+            return
         try:
             n = int(self.headers.get("Content-Length", "0"))
+            if n < 0 or n > MAX_BODY_BYTES:
+                self.json_response({"error": "请求体过大"}, 413)
+                return
             data = json.loads(self.rfile.read(n) or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError("请求格式错误")
             if self.path == "/api/process":
                 text = call_ai(data)
                 self.json_response({"text": text})
@@ -1574,14 +1832,21 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/save-key":
                 provider = normalize_provider(data.get("provider"))
                 storage = save_api_key(data.get("api_key"), provider)
+                record_key_base(provider, data.get("api_base"))
                 key = data.get("api_key", "").strip()
                 self.json_response(
-                    {"saved": True, "storage": storage, "masked": "••••" + key[-4:]}
+                    {
+                        "saved": True,
+                        "storage": storage,
+                        "masked": "••••" + key[-4:],
+                        "allowed_base": allowed_base_for_stored_key(provider),
+                    }
                 )
                 return
             if self.path == "/api/delete-key":
                 provider = normalize_provider(data.get("provider"))
                 delete_saved_api_key(provider)
+                forget_key_base(provider)
                 self.json_response({"saved": False, "provider": provider})
                 return
             self.send_error(404)

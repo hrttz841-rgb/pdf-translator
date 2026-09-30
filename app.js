@@ -1,6 +1,70 @@
-import * as pdfjsLib from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs";
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
+// 第三方库优先使用仓库内 vendor/ 目录中的本地副本，离线可用；本地副本缺失时回退到 CDN。
+const PDFJS_CDN = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38";
+const localUrl = (p) => new URL(p, document.baseURI).href;
+async function loadPdfjs() {
+  const sources = [
+    {
+      lib: localUrl("vendor/pdfjs/pdf.min.mjs"),
+      root: localUrl("vendor/pdfjs/"),
+    },
+    { lib: PDFJS_CDN + "/pdf.min.mjs", root: PDFJS_CDN + "/" },
+  ];
+  for (const s of sources) {
+    try {
+      const mod = await import(s.lib);
+      mod.GlobalWorkerOptions.workerSrc = s.root + "pdf.worker.min.mjs";
+      return {
+        lib: mod,
+        cMapUrl: s.root === sources[0].root ? s.root + "cmaps/" : null,
+        standardFontDataUrl:
+          s.root === sources[0].root ? s.root + "standard_fonts/" : null,
+      };
+    } catch (e) {
+      console.warn("pdf.js 加载失败：" + s.lib, e);
+    }
+  }
+  throw new Error("无法加载 pdf.js（本地 vendor 目录缺失且无法访问 CDN）");
+}
+const PDFJS = await loadPdfjs();
+const pdfjsLib = PDFJS.lib;
+// 本地服务的会话令牌由服务端注入页面；所有 /api 请求都需携带，其他网站无法获取。
+const SESSION_TOKEN =
+  document.querySelector('meta[name="spt-token"]')?.content || "";
+function backendBase() {
+  // 通过启动脚本打开时页面与接口同源，直接使用当前地址，避免端口变化后指向旧端口
+  if (location.protocol.startsWith("http")) return location.origin;
+  return $("backend").value.replace(/\/$/, "");
+}
+function apiFetch(path, opt = {}) {
+  const headers = { ...(opt.headers || {}), "X-SPT-Token": SESSION_TOKEN };
+  return fetch(backendBase() + path, { ...opt, headers });
+}
+const localFileExists = async (p) => {
+  try {
+    return (await fetch(localUrl(p), { method: "HEAD" })).ok;
+  } catch (e) {
+    return false;
+  }
+};
+async function tesseractOptions(langs) {
+  // 本地文件齐全时使用本地路径；缺失的部分不传参数，沿用 Tesseract.js 默认的 CDN 地址
+  const opts = {};
+  if (await localFileExists("vendor/tesseract/worker.min.js"))
+    opts.workerPath = localUrl("vendor/tesseract/worker.min.js");
+  if (
+    await localFileExists("vendor/tesseract/core/tesseract-core-lstm.wasm.js")
+  )
+    opts.corePath = localUrl("vendor/tesseract/core");
+  const needed = String(langs || "eng")
+    .split("+")
+    .filter(Boolean);
+  let localLang = needed.length > 0;
+  for (const l of needed)
+    if (!(await localFileExists(`vendor/tesseract/lang/${l}.traineddata.gz`)))
+      localLang = false;
+  if (localLang) opts.langPath = localUrl("vendor/tesseract/lang");
+  return opts;
+}
 const $ = (id) => document.getElementById(id);
 const state = {
   pdf: null,
@@ -264,14 +328,11 @@ async function importExisting(file) {
     for (let i = 0; i < buf.length; i += step)
       bin += String.fromCharCode(...buf.subarray(i, i + step));
     const b64 = btoa(bin);
-    const r = await fetch(
-      $("backend").value.replace(/\/$/, "") + "/api/import-docx",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base64: b64, file_name: name }),
-      },
-    );
+    const r = await apiFetch("/api/import-docx", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base64: b64, file_name: name }),
+    });
     const obj = await r.json();
     if (!r.ok) throw new Error(obj.error || `HTTP ${r.status}`);
     activateImportedProject(name, obj.pages, obj.kind);
@@ -284,7 +345,13 @@ async function loadPdf(file) {
   state.manuscript = null;
   state.importMode = null;
   const buf = await file.arrayBuffer();
-  state.pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  state.pdf = await pdfjsLib.getDocument({
+    data: buf,
+    ...(PDFJS.cMapUrl ? { cMapUrl: PDFJS.cMapUrl, cMapPacked: true } : {}),
+    ...(PDFJS.standardFontDataUrl
+      ? { standardFontDataUrl: PDFJS.standardFontDataUrl }
+      : {}),
+  }).promise;
   state.pages = Array.from({ length: state.pdf.numPages }, (_, i) => ({
     n: i + 1,
     raw: "",
@@ -304,7 +371,14 @@ async function loadPdf(file) {
   log(`加载 ${file.name}，共 ${state.pdf.numPages} 页。`);
   await showPage(0);
 }
-async function renderPage(pageNo) {
+// 同一画布上的渲染必须串行，否则 pdf.js 会报错（例如加载后立即点击解析、快速翻页时）
+let renderQueue = Promise.resolve();
+function renderPage(pageNo) {
+  const job = renderQueue.then(() => renderPageNow(pageNo));
+  renderQueue = job.catch(() => {});
+  return job;
+}
+async function renderPageNow(pageNo) {
   const page = await state.pdf.getPage(pageNo);
   const viewport = page.getViewport({ scale: state.scale });
   const c = $("pdfCanvas"),
@@ -491,10 +565,12 @@ async function parsePage(idx) {
     markStep(2);
     status(`OCR 第 ${idx + 1} 页…`);
     await renderPage(idx + 1);
+    const ocrLang = $("ocrLang").value;
     const result = await Tesseract.recognize(
       $("pdfCanvas").toDataURL("image/png"),
-      $("ocrLang").value,
+      ocrLang,
       {
+        ...(await tesseractOptions(ocrLang)),
         logger: (m) => {
           if (m.status === "recognizing text")
             progress(
@@ -646,11 +722,10 @@ function applyProviderPreset(p) {
   refreshKeyStatus();
 }
 async function keyRequest(path, payload = {}) {
-  const base = $("backend").value.replace(/\/$/, "");
   const provider = providerName();
   const isStatus = path.endsWith("key-status");
   const url =
-    base + path + (isStatus ? `?provider=${encodeURIComponent(provider)}` : "");
+    path + (isStatus ? `?provider=${encodeURIComponent(provider)}` : "");
   const body = { provider, ...payload };
   const opt = isStatus
     ? {}
@@ -659,7 +734,7 @@ async function keyRequest(path, payload = {}) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       };
-  const r = await fetch(url, opt);
+  const r = await apiFetch(url, opt);
   let data = {};
   try {
     data = await r.json();
@@ -686,7 +761,10 @@ async function saveKey() {
     await refreshKeyStatus();
     return false;
   }
-  const x = await keyRequest("/api/save-key", { api_key: key });
+  const x = await keyRequest("/api/save-key", {
+    api_key: key,
+    api_base: $("apiBase").value.trim(),
+  });
   $("apiKey").value = "";
   $("keyStatus").textContent = `已保存到 ${x.storage} ${x.masked}`;
   $("deleteKeyBtn").disabled = false;
@@ -715,14 +793,11 @@ async function apiCall(task, text, context = "", source = "") {
     custom_prompt: $("customPrompt").value,
     context,
   };
-  const r = await fetch(
-    $("backend").value.replace(/\/$/, "") + "/api/process",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    },
-  );
+  const r = await apiFetch("/api/process", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
   const raw = await r.text();
   let data = {};
   try {
@@ -1062,14 +1137,11 @@ async function exportWord(mode = "translated") {
       manuscript,
       true_footnotes: $("trueFootnotes").checked,
     };
-    const r = await fetch(
-      $("backend").value.replace(/\/$/, "") + "/api/export-docx",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      },
-    );
+    const r = await apiFetch("/api/export-docx", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
     if (!r.ok) {
       let msg = await r.text();
       try {
@@ -1276,6 +1348,7 @@ $("clearBtn").onclick = () => {
   if (confirm("清空当前项目？")) location.reload();
 };
 loadSettings();
+if (location.protocol.startsWith("http")) $("backend").value = location.origin;
 if (!$("provider").value) $("provider").value = "deepseek";
 $("providerSettings").value = $("provider").value;
 $("modelSettings").value = $("model").value;
