@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pdf_translator.pid
+.pdf_translator.port
+pdf-translator.log
+pdf-translator-error.log
+.DS_Store
