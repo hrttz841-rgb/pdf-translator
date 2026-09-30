@@ -1,5 +1,9 @@
 # Scholar PDF Translator v2.6
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+**Created and maintained by Yifei Liu.**
+
 Scholar PDF Translator 是一个面向学术研究、专业阅读和长篇文献处理的本地 PDF 翻译与中文书稿重建工具。它试图解决一个在现有 AI 翻译工作流中经常被忽视的问题：**真正影响学术阅读效率的，不只是“能不能把句子翻译出来”，还包括能不能正确理解一本书或一篇论文的结构，并把翻译结果重新组织成一份可持续阅读、引用、校对和编辑的正式文稿。**
 
 目前许多常见的 AI 翻译工具更擅长完成“文本层面的翻译”，但在处理复杂 PDF 时往往会遇到一系列结构性问题，例如：
