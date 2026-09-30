@@ -15,13 +15,15 @@ from pathlib import Path
 
 import pytest
 
+import ai_client
+import keystore
 import server
 
 
 @pytest.fixture()
 def srv(tmp_path, monkeypatch):
     """在随机端口启动服务；Key 存放在临时目录，AI 请求被拦截记录，不会真正联网。"""
-    monkeypatch.setattr(server, "KEY_DIR", tmp_path / "keys")
+    monkeypatch.setattr(keystore, "KEY_DIR", tmp_path / "keys")
     monkeypatch.setattr(server.platform, "system", lambda: "Linux")
     for info in server.PROVIDERS.values():
         monkeypatch.delenv(info["env"], raising=False)
@@ -31,7 +33,7 @@ def srv(tmp_path, monkeypatch):
         calls.append({"url": url, "headers": headers, "payload": payload})
         return {"choices": [{"message": {"content": "译文"}}]}
 
-    monkeypatch.setattr(server, "_post_json", fake_post_json)
+    monkeypatch.setattr(ai_client, "_post_json", fake_post_json)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
     port = httpd.server_address[1]
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -397,7 +399,7 @@ def test_call_ai_builds_requests_for_each_api_kind(monkeypatch, provider):
             return {"candidates": [{"content": {"parts": [{"text": "好"}]}}]}
         return {"choices": [{"message": {"content": "好"}}]}
 
-    monkeypatch.setattr(server, "_post_json", fake)
+    monkeypatch.setattr(ai_client, "_post_json", fake)
     out = server.call_ai(
         {"provider": provider, "api_key": "k", "text": "good", "task": "translate"}
     )
