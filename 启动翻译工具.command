@@ -4,7 +4,7 @@ set -u
 cd "$(dirname "$0")" || exit 1
 
 BASE_PORT=8765
-EXPECTED_VERSION="2.7.0"
+EXPECTED_VERSION="2.8.0"
 PID_FILE=".pdf_translator.pid"
 PORT_FILE=".pdf_translator.port"
 LOG_FILE="pdf-translator.log"

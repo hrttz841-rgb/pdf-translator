@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PDF_TRANSLATOR_PORT", "8765"))
 APP_ID = "scholar-pdf-translator"
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 # 每次启动随机生成的会话令牌。只注入到本服务提供的页面中，其他网站无法读取，
 # 因而无法冒用本地服务调用 AI 接口或管理已保存的 API Key。
 SESSION_TOKEN = secrets.token_urlsafe(32)
