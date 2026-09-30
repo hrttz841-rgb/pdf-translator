@@ -162,8 +162,11 @@ function normalizeHF(s) {
     .replace(/[^\p{L}\p{N}# ]/gu, "")
     .trim();
 }
+// 只有用户手动编辑过编辑框时才把内容写回状态，避免程序更新（解析、清洗）后的新内容被旧的编辑框内容覆盖
+let editorsDirty = false;
 function syncEditors() {
-  if (!state.pages.length) return;
+  if (!state.pages.length || !editorsDirty) return;
+  editorsDirty = false;
   const p = state.pages[state.current];
   const ns = $("sourceEditor").innerText.trim(),
     nt = $("targetEditor").innerText.trim();
@@ -415,6 +418,7 @@ async function showPage(i) {
   const p = state.pages[state.current];
   $("sourceEditor").innerText = p.source || "";
   $("targetEditor").innerText = p.target || "";
+  editorsDirty = false;
   $("pageInfo").textContent = `${p.n} / ${state.pages.length}`;
   let st = p.approved
     ? "已人工检查"
@@ -1347,6 +1351,8 @@ $("testBtn").onclick = async () => {
 $("clearBtn").onclick = () => {
   if (confirm("清空当前项目？")) location.reload();
 };
+for (const id of ["sourceEditor", "targetEditor"])
+  $(id).addEventListener("input", () => (editorsDirty = true));
 loadSettings();
 if (location.protocol.startsWith("http")) $("backend").value = location.origin;
 if (!$("provider").value) $("provider").value = "deepseek";
