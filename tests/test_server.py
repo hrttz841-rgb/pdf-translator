@@ -403,3 +403,12 @@ def test_call_ai_builds_requests_for_each_api_kind(monkeypatch, provider):
     )
     assert out == "好"
     assert seen["url"].startswith(server.PROVIDERS[provider]["base"])
+
+
+def test_pdfjs_cmaps_and_fonts_are_served(srv):
+    for path in (
+        "/vendor/pdfjs/cmaps/UniGB-UCS2-H.bcmap",
+        "/vendor/pdfjs/standard_fonts/FoxitSerif.pfb",
+    ):
+        r, data = request(srv, "GET", path, token=False)
+        assert r.status == 200 and len(data) > 100, path

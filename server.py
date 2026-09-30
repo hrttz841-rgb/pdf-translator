@@ -1628,6 +1628,9 @@ STATIC_MIME = {
     ".svg": "image/svg+xml",
     ".gz": "application/gzip",
     ".md": "text/plain; charset=utf-8",
+    ".bcmap": "application/octet-stream",
+    ".pfb": "application/octet-stream",
+    ".ttf": "font/ttf",
 }
 
 

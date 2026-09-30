@@ -391,7 +391,12 @@
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <script src="vendor/tesseract/tesseract.min.js"></script>
+  <script>
+    // 本地副本缺失时回退到 CDN
+    if (!window.Tesseract)
+      document.write('<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"><\/script>');
+  </script>
   <script type="module" src="app.js"></script>
 </body>
 </html>
