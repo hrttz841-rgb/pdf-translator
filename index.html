@@ -7,392 +7,411 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <header>
-    <h1>Scholar PDF Translator</h1>
-    <span class="badge">v2.7 · 多模型 PDF 翻译 → 中文书稿 / 真脚注重建</span>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">译</span>
+      <span class="brand-name">Scholar PDF Translator</span>
+    </div>
+    <div class="doc-title" id="docTitle">尚未打开文档</div>
+    <div class="topbar-actions">
+      <button id="shortcutsBtn" class="icon-btn" title="快捷键（?）" aria-label="快捷键">?</button>
+      <button id="settingsBtn" class="btn quiet">设置</button>
+    </div>
   </header>
+
   <div class="app">
-    <aside class="panel sidebar">
-      <h2>文档与引擎</h2>
-      <div id="drop" class="drop">
-        <strong>拖入 PDF</strong>
-        <div class="muted">电子 PDF 优先读取文本层；扫描页才 OCR。</div>
-        <input
-          id="file"
-          type="file"
-          accept="application/pdf"
-          style="margin-top: 9px"
-        />
-      </div>
-      <div class="group">
-        <strong style="font-size: 13px">已有译文直接重建</strong>
-        <div class="muted" style="margin-top: 5px">
-          已有翻译无需重跑。支持本工具导出的双语 HTML、译文
-          HTML、Word（.docx）和项目 JSON。
+    <aside class="sidebar">
+      <section class="side-section">
+        <h2>文档</h2>
+        <label id="drop" class="drop" tabindex="0">
+          <input id="file" type="file" accept=".pdf,.html,.htm,.docx,.json,application/pdf,text/html,application/json,application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
+          <span class="drop-title">拖入文件，或点击选择</span>
+          <span class="drop-hint">PDF 从头处理；已有译文（双语或译文 HTML、Word、项目 JSON）直接进入书稿重建</span>
+        </label>
+        <div id="fileInfo" class="file-info" hidden></div>
+      </section>
+
+      <section class="side-section">
+        <h2>翻译要求</h2>
+        <div class="field-row">
+          <div class="field">
+            <label for="sourceLang">原文</label>
+            <select id="sourceLang">
+              <option value="auto">自动识别</option>
+              <option value="en">英文</option>
+              <option value="zh">中文</option>
+              <option value="ja">日文</option>
+              <option value="fr">法文</option>
+              <option value="de">德文</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="targetLang">译为</label>
+            <select id="targetLang">
+              <option value="zh-CN">简体中文</option>
+              <option value="en">英文</option>
+            </select>
+          </div>
         </div>
-        <input
-          id="importFile"
-          type="file"
-          accept=".html,.htm,.docx,.json,text/html,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/json"
-          style="margin-top: 9px"
-        /><button
-          id="importBtn"
-          class="secondary"
-          style="width: 100%; margin-top: 7px"
-        >
-          导入已有译文
-        </button>
-        <div id="importHint" class="muted" style="margin-top: 6px">
-          双语文件优先：保留原文用于结构判断；纯译文也可直接生成中文书稿。
-        </div>
-      </div>
-      <div class="group">
-        <label>源语言 / 目标语言</label>
-        <div class="inline">
-          <select id="sourceLang">
-            <option value="auto">自动识别</option>
-            <option value="en">英文</option>
-            <option value="zh">中文</option>
-            <option value="ja">日文</option>
-            <option value="fr">法文</option>
-            <option value="de">德文</option></select
-          ><select id="targetLang">
-            <option value="zh-CN">简体中文</option>
-            <option value="en">英文</option>
+        <div class="field">
+          <label for="style">风格</label>
+          <select id="style">
+            <option value="academic">学术中文：准确、克制、术语一致</option>
+            <option value="formal">正式书面语</option>
+            <option value="literal">偏直译</option>
           </select>
         </div>
-        <label>AI 平台 / 模型</label>
-        <div class="inline">
-          <select id="provider">
-            <option value="deepseek">DeepSeek</option>
-            <option value="openai">OpenAI</option>
-            <option value="anthropic">Anthropic Claude</option>
-            <option value="gemini">Google Gemini</option>
-            <option value="qwen">Alibaba Qwen</option>
-            <option value="kimi">Moonshot Kimi</option>
-            <option value="openrouter">OpenRouter</option>
-            <option value="custom">自定义 OpenAI-compatible</option></select
-          ><input
-            id="model"
-            value="deepseek-chat"
-            list="modelHints"
-            placeholder="模型 ID"
-          />
+        <div class="field">
+          <label for="glossary">术语表 <span class="label-note">每行一条：原词 = 译词</span></label>
+          <textarea id="glossary" rows="4" placeholder="state capacity = 国家能力&#10;accountability = 问责"></textarea>
         </div>
-        <datalist id="modelHints">
-          <option value="deepseek-chat"></option>
-          <option value="deepseek-reasoner"></option>
-          <option value="gpt-5"></option>
-          <option value="claude-sonnet-4-5"></option>
-          <option value="gemini-2.5-pro"></option>
-          <option value="qwen-plus"></option>
-          <option value="moonshot-v1-32k"></option>
-          <option value="openai/gpt-5"></option>
-        </datalist>
-        <label>版面模式</label
-        ><select id="layoutMode">
-          <option value="auto">自动识别单双栏</option>
-          <option value="single">强制单栏</option>
-          <option value="double">强制双栏</option>
-        </select>
-        <label>OCR 模式</label
-        ><select id="ocrMode">
-          <option value="auto">自动：文本层不足时 OCR</option>
-          <option value="always">全部 OCR</option>
-          <option value="never">仅文本层</option>
-        </select>
-      </div>
-      <div class="group">
-        <label>翻译风格</label
-        ><select id="style">
-          <option value="academic">学术中文：准确、克制、术语一致</option>
-          <option value="formal">正式书面语</option>
-          <option value="literal">偏直译</option>
-        </select>
-        <label>术语表（原词 = 译词）</label
-        ><textarea
-          id="glossary"
-          placeholder="state capacity = 国家能力\naccountability = 问责"
-        ></textarea>
-        <label>额外要求</label
-        ><textarea
-          id="customPrompt"
-          placeholder="例如：参考文献不翻译；保留脚注编号；机构缩写首次保留英文。"
-        ></textarea>
-      </div>
-      <div class="group">
-        <button id="settingsBtn" class="secondary" style="width: 100%">
-          AI 平台 / OCR / 校对设置
+        <div class="field">
+          <label for="customPrompt">额外要求</label>
+          <textarea id="customPrompt" rows="3" placeholder="例如：参考文献不翻译；机构缩写首次出现时保留英文"></textarea>
+        </div>
+      </section>
+
+      <section class="side-section">
+        <h2>模型</h2>
+        <button id="engineCard" class="engine-card" type="button">
+          <span class="engine-line"><strong id="engineName">DeepSeek</strong><span id="engineModel" class="engine-model">deepseek-chat</span></span>
+          <span id="engineKey" class="engine-key">正在检查 Key…</span>
         </button>
-        <div class="muted" style="margin-top: 7px">
-          普通设置保存在当前浏览器；不同 AI 平台的 API Key
-          会分别安全保存到本机系统凭据存储。
-        </div>
-      </div>
+      </section>
     </aside>
+
     <main class="main">
-      <section class="panel steps">
-        <div class="step" data-step="1">
-          <b>1. 版面分析</b><span>文本块与单双栏</span>
-        </div>
-        <div class="step" data-step="2">
-          <b>2. OCR</b><span>仅处理扫描页</span>
-        </div>
-        <div class="step" data-step="3">
-          <b>3. 清洗分段</b><span>页眉页脚与断词</span>
-        </div>
-        <div class="step" data-step="4">
-          <b>4. 翻译</b><span>跨页上下文</span>
-        </div>
-        <div class="step" data-step="5">
-          <b>5. 校对</b><span>漏译数字术语</span>
-        </div>
-        <div class="step" data-step="6">
-          <b>6. 重排与导出</b><span>译文 / 对照 Word</span>
-        </div>
-      </section>
-      <section class="panel toolbar">
-        <button id="runBtn" class="primary" disabled>完整处理</button
-        ><button id="parseBtn" class="ghost" disabled>仅解析当前页</button
-        ><button id="translateBtn" class="ghost" disabled>翻译当前页</button
-        ><button id="proofBtn" class="ghost" disabled>校对当前页</button
-        ><button id="auditBtn" class="ghost" disabled>全文一致性检查</button
-        ><button id="reconstructBtn" class="secondary" disabled>
-          AI 书稿重建
+      <nav class="pipeline" aria-label="处理流程">
+        <button class="stage" data-stage="parse" disabled>
+          <span class="stage-name">解析</span><span class="stage-count" id="cParse">0/0</span>
+          <span class="stage-bar"><i id="bParse"></i></span>
         </button>
-        <div class="spacer"></div>
-        <span id="status" class="status">等待 PDF</span
-        ><button id="exportWord" class="primary" disabled>
-          下载中文书稿 Word</button
-        ><button id="exportBilingualWord" class="secondary" disabled>
-          下载对照 Word</button
-        ><button id="saveProject" class="ghost" disabled>保存项目</button
-        ><button id="exportHtml" class="ghost" disabled>译文 HTML</button
-        ><button id="exportBilingual" class="ghost" disabled>双语 HTML</button>
-      </section>
-      <section class="panel workspace">
-        <div class="col">
-          <div class="colhead">
-            <h3>原文与版面</h3>
-            <div class="pageNav">
-              <button id="prev" class="small ghost">上一页</button
-              ><span id="pageInfo">0 / 0</span
-              ><button id="next" class="small ghost">下一页</button>
+        <button class="stage" data-stage="clean" disabled>
+          <span class="stage-name">清洗</span><span class="stage-count" id="cClean">未进行</span>
+          <span class="stage-bar"><i id="bClean"></i></span>
+        </button>
+        <button class="stage" data-stage="translate" disabled>
+          <span class="stage-name">翻译</span><span class="stage-count" id="cTranslate">0/0</span>
+          <span class="stage-bar"><i id="bTranslate"></i></span>
+        </button>
+        <button class="stage" data-stage="proof" disabled>
+          <span class="stage-name">校对</span><span class="stage-count" id="cProof">0/0</span>
+          <span class="stage-bar"><i id="bProof"></i></span>
+        </button>
+        <button class="stage" data-stage="reconstruct" disabled>
+          <span class="stage-name">书稿重建</span><span class="stage-count" id="cReconstruct">未进行</span>
+          <span class="stage-bar"><i id="bReconstruct"></i></span>
+        </button>
+        <button class="stage" data-stage="approve" disabled>
+          <span class="stage-name">人工检查</span><span class="stage-count" id="cApprove">0/0</span>
+          <span class="stage-bar"><i id="bApprove"></i></span>
+        </button>
+      </nav>
+
+      <div class="toolbar">
+        <div class="tool-group">
+          <button id="runBtn" class="btn primary" disabled>完整处理</button>
+          <button id="pauseBtn" class="btn" hidden>处理完当前页后暂停</button>
+          <button id="retryBtn" class="btn warn" hidden>重试出错页</button>
+        </div>
+        <div class="tool-group">
+          <button id="auditBtn" class="btn" disabled>全文术语检查</button>
+          <button id="reconstructBtn" class="btn" disabled>书稿重建</button>
+        </div>
+        <div class="tool-spacer"></div>
+        <span id="status" class="status" role="status">等待文档</span>
+        <div class="menu">
+          <button id="exportMenuBtn" class="btn primary" aria-haspopup="true" aria-expanded="false" disabled>导出</button>
+          <div id="exportMenu" class="menu-list" role="menu" hidden>
+            <button id="exportWord" role="menuitem" disabled><strong>中文书稿 Word</strong><span>按章节重排，注释转为页下注</span></button>
+            <button id="exportBilingualWord" role="menuitem" disabled><strong>对照 Word</strong><span>A4 横向，原文译文左右对照</span></button>
+            <button id="exportHtml" role="menuitem" disabled><strong>译文 HTML</strong><span>逐页译文，便于浏览器阅读</span></button>
+            <button id="exportBilingual" role="menuitem" disabled><strong>双语 HTML</strong><span>逐页原文与译文对照</span></button>
+            <hr />
+            <button id="saveProject" role="menuitem" disabled><strong>保存项目</strong><span>JSON 文件，之后可导入继续工作</span></button>
+          </div>
+        </div>
+      </div>
+
+      <section class="workspace">
+        <nav class="page-rail" aria-label="页面">
+          <select id="pageFilter" aria-label="筛选页面">
+            <option value="all">全部页</option>
+            <option value="todo">未翻译</option>
+            <option value="unproofed">未校对</option>
+            <option value="unapproved">未检查</option>
+            <option value="error">出错</option>
+          </select>
+          <ol id="pageList" class="page-list"></ol>
+          <div class="rail-legend">
+            <span><i class="dot s-parsed"></i>已解析</span>
+            <span><i class="dot s-translated"></i>已翻译</span>
+            <span><i class="dot s-proofed"></i>已校对</span>
+            <span><i class="dot s-approved"></i>已检查</span>
+            <span><i class="dot s-error"></i>出错</span>
+          </div>
+        </nav>
+
+        <div class="pane source-pane">
+          <div class="pane-head">
+            <div class="tabs" role="tablist">
+              <button class="tab active" data-view="page" role="tab">页面</button>
+              <button class="tab" data-view="text" role="tab">原文</button>
+              <button class="tab" data-view="pairs" role="tab">逐段对照</button>
+            </div>
+            <div class="page-nav">
+              <button id="prev" class="icon-btn" title="上一页（Alt+←）" aria-label="上一页">‹</button>
+              <span id="pageInfo">0 / 0</span>
+              <button id="next" class="icon-btn" title="下一页（Alt+→）" aria-label="下一页">›</button>
             </div>
           </div>
-          <div class="canvasWrap" id="canvasWrap">
-            <canvas id="pdfCanvas"></canvas>
-            <div id="overlay" class="overlay"></div>
+          <div class="view" data-view="page">
+            <div class="canvasWrap" id="canvasWrap">
+              <canvas id="pdfCanvas"></canvas>
+              <div id="overlay" class="overlay"></div>
+            </div>
+            <div id="noPageImage" class="empty" hidden>导入的译文没有页面图像，可在“原文”或“逐段对照”中查看文字。</div>
           </div>
-          <div class="chips" id="pageMeta"></div>
-          <label>清洗后的原文（可修改）</label>
-          <div id="sourceEditor" class="editor" contenteditable="true"></div>
-        </div>
-        <div class="col">
-          <div class="colhead">
-            <h3>译文 / 校订稿</h3>
-            <div>
-              <button id="approveBtn" class="small ghost">
-                标记已人工检查
-              </button>
-              <span id="pageState" class="pill">未处理</span>
+          <div class="view" data-view="text" hidden>
+            <div id="sourceEditor" class="editor source" contenteditable="true" spellcheck="false" aria-label="清洗后的原文"></div>
+          </div>
+          <div class="view" data-view="pairs" hidden>
+            <div id="pairView" class="pairs"></div>
+          </div>
+          <div class="pane-foot">
+            <div class="chips" id="pageMeta"></div>
+            <div class="page-actions">
+              <button id="parseBtn" class="btn small" disabled>重新解析本页</button>
             </div>
           </div>
-          <div
-            id="targetEditor"
-            class="editor target"
-            contenteditable="true"
-          ></div>
+        </div>
+
+        <div class="pane target-pane">
+          <div class="pane-head">
+            <h3>译文</h3>
+            <span id="pageState" class="pill">未处理</span>
+          </div>
+          <div id="targetEditor" class="editor target" contenteditable="true" spellcheck="false" aria-label="译文"></div>
+          <div id="pageError" class="page-error" hidden></div>
+          <div class="pane-foot">
+            <div class="page-actions">
+              <button id="translateBtn" class="btn small" disabled title="Ctrl/⌘+Enter">翻译本页</button>
+              <button id="proofBtn" class="btn small" disabled>校对本页</button>
+              <button id="approveBtn" class="btn small ok" disabled title="Ctrl/⌘+Shift+Enter">标记已检查</button>
+            </div>
+          </div>
         </div>
       </section>
-      <section class="panel bottom">
-        <div class="inline">
-          <div style="flex: 1">
-            <div class="muted" id="progressText">尚未开始</div>
-            <div class="progress"><div id="progressBar"></div></div>
-          </div>
-          <button id="clearBtn" class="small danger">清空项目</button>
+
+      <section class="progress-area">
+        <div class="progress-line">
+          <div class="progress"><div id="progressBar"></div></div>
+          <span id="progressText" class="progress-text">尚未开始</span>
+          <span id="eta" class="eta"></span>
         </div>
-        <div class="reviewGrid">
-          <div class="metric"><b id="mParsed">0</b><span>已解析页</span></div>
-          <div class="metric">
-            <b id="mTranslated">0</b><span>已翻译页</span>
-          </div>
-          <div class="metric"><b id="mProofed">0</b><span>已校对页</span></div>
-          <div class="metric">
-            <b id="mApproved">0</b><span>人工检查页</span>
-          </div>
-        </div>
-        <div id="log" class="log">系统就绪。</div>
+        <details id="logDetails" class="log-wrap">
+          <summary>处理记录</summary>
+          <div id="log" class="log">系统就绪。</div>
+        </details>
+        <button id="clearBtn" class="btn small danger-text">清空项目</button>
       </section>
     </main>
   </div>
-  <div id="modal" class="modal">
+
+  <!-- 设置 -->
+  <div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
     <div class="modalbox">
-      <h3>处理设置</h3>
-      <div class="row">
-        <div>
-          <label>本地代理地址</label
-          ><input id="backend" value="http://127.0.0.1:8765" />
-        </div>
-        <div>
-          <label>AI 平台</label
-          ><select id="providerSettings">
-            <option value="deepseek">DeepSeek</option>
-            <option value="openai">OpenAI</option>
-            <option value="anthropic">Anthropic Claude</option>
-            <option value="gemini">Google Gemini</option>
-            <option value="qwen">Alibaba Qwen</option>
-            <option value="kimi">Moonshot Kimi</option>
-            <option value="openrouter">OpenRouter</option>
-            <option value="custom">自定义 OpenAI-compatible</option>
-          </select>
+      <div class="modal-head">
+        <h3 id="settingsTitle">设置</h3>
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-settings-tab="ai" role="tab">AI 平台与 Key</button>
+          <button class="tab" data-settings-tab="ocr" role="tab">识别与版面</button>
+          <button class="tab" data-settings-tab="output" role="tab">翻译与导出</button>
         </div>
       </div>
-      <div class="row">
-        <div>
-          <label>API Base</label
-          ><input id="apiBase" value="https://api.deepseek.com" />
+      <div id="settingsNotice" class="notice" hidden></div>
+
+      <div class="settings-tab" data-settings-tab="ai">
+        <div class="field-row">
+          <div class="field">
+            <label for="provider">AI 平台</label>
+            <select id="provider">
+              <option value="deepseek">DeepSeek</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic Claude</option>
+              <option value="gemini">Google Gemini</option>
+              <option value="qwen">Alibaba Qwen</option>
+              <option value="kimi">Moonshot Kimi</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="custom">自定义（OpenAI 兼容接口）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="model">模型 ID</label>
+            <input id="model" value="deepseek-chat" list="modelHints" placeholder="例如 deepseek-chat" />
+            <datalist id="modelHints">
+              <option value="deepseek-chat"></option>
+              <option value="deepseek-reasoner"></option>
+              <option value="gpt-5"></option>
+              <option value="claude-sonnet-4-5"></option>
+              <option value="gemini-2.5-pro"></option>
+              <option value="qwen-plus"></option>
+              <option value="moonshot-v1-32k"></option>
+              <option value="openai/gpt-5"></option>
+            </datalist>
+          </div>
         </div>
-        <div>
-          <label>模型 ID</label
-          ><input
-            id="modelSettings"
-            value="deepseek-chat"
-            placeholder="例如 deepseek-chat"
-          />
+        <div class="field">
+          <label for="apiBase">API 地址</label>
+          <input id="apiBase" value="https://api.deepseek.com" />
+        </div>
+        <p class="hint" id="providerHelp">DeepSeek：deepseek-chat / deepseek-reasoner。</p>
+        <p class="hint">预设的模型 ID 只是默认值，平台会不断推出和下线模型，请以对应平台的最新文档和你账户中可用的模型为准。</p>
+        <div class="field">
+          <label for="apiKey">API Key</label>
+          <input id="apiKey" type="password" placeholder="输入后点击“保存 Key”，保存在本机系统凭据中" autocomplete="off" />
+        </div>
+        <div class="key-row">
+          <button id="saveKeyBtn" class="btn small" type="button">保存 Key</button>
+          <button id="deleteKeyBtn" class="btn small" type="button">删除 Key</button>
+          <span id="keyStatus" class="hint">正在检查…</span>
+        </div>
+        <p class="hint">已保存的 Key 只会发送到保存时的 API 地址。更换地址后需要重新保存 Key。</p>
+        <details class="advanced">
+          <summary>高级</summary>
+          <div class="field">
+            <label for="backend">本地服务地址</label>
+            <input id="backend" value="http://127.0.0.1:8765" />
+            <p class="hint">通过启动脚本打开时会自动使用当前地址，一般无需修改。</p>
+          </div>
+        </details>
+      </div>
+
+      <div class="settings-tab" data-settings-tab="ocr" hidden>
+        <div class="field-row">
+          <div class="field">
+            <label for="layoutMode">版面</label>
+            <select id="layoutMode">
+              <option value="auto">自动识别单双栏</option>
+              <option value="single">强制单栏</option>
+              <option value="double">强制双栏</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="ocrMode">OCR</label>
+            <select id="ocrMode">
+              <option value="auto">文本层不足时 OCR</option>
+              <option value="always">全部 OCR</option>
+              <option value="never">只读文本层</option>
+            </select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="ocrLang">OCR 语言</label>
+            <select id="ocrLang">
+              <option value="eng">英文</option>
+              <option value="chi_sim+eng">中文与英文</option>
+              <option value="jpn+eng">日文与英文</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="ocrThreshold">触发 OCR 的字符数（每页少于）</label>
+            <input id="ocrThreshold" type="number" value="80" min="0" max="1000" />
+          </div>
+        </div>
+        <div class="checks">
+          <label><input id="removeHeaders" type="checkbox" checked />删除重复的页眉页脚和页码</label>
+          <label><input id="showBoxes" type="checkbox" checked />在页面上显示识别出的文本块</label>
         </div>
       </div>
-      <div class="muted">
-        各平台预设的模型 ID 只是默认值，平台会不断推出和下线模型，请以对应平台的最新文档和你的账户可用模型为准。
-      </div>
-      <label>API Key</label
-      ><input
-        id="apiKey"
-        type="password"
-        placeholder="首次输入后可永久保存到本机安全凭据存储"
-        autocomplete="off"
-      />
-      <div
-        style="display: flex; gap: 8px; align-items: center; margin: 7px 0 12px"
-      >
-        <button id="saveKeyBtn" class="ghost" type="button">
-          保存当前平台 Key</button
-        ><button id="deleteKeyBtn" class="ghost" type="button">
-          删除当前平台 Key</button
-        ><span id="keyStatus" class="muted">正在检查…</span>
-      </div>
-      <div class="muted" id="providerHelp">
-        DeepSeek：默认 https://api.deepseek.com，可使用 deepseek-chat /
-        deepseek-reasoner。
-      </div>
-      <div class="row">
-        <div>
-          <label>翻译分段上限（字符）</label
-          ><input
-            id="chunkSize"
-            type="number"
-            value="3200"
-            min="500"
-            max="12000"
-          />
+
+      <div class="settings-tab" data-settings-tab="output" hidden>
+        <div class="field-row">
+          <div class="field">
+            <label for="chunkSize">单次翻译的最大字符数</label>
+            <input id="chunkSize" type="number" value="3200" min="500" max="12000" />
+          </div>
+          <div class="field">
+            <label for="contextChars">带入的上一页译文字符数</label>
+            <input id="contextChars" type="number" value="1200" min="0" max="5000" />
+          </div>
         </div>
-        <div>
-          <label>OCR 触发阈值（字符/页）</label
-          ><input
-            id="ocrThreshold"
-            type="number"
-            value="80"
-            min="0"
-            max="1000"
-          />
+        <div class="field-row">
+          <div class="field">
+            <label for="manuscriptBatchPages">书稿重建每批页数</label>
+            <select id="manuscriptBatchPages">
+              <option value="4">4 页（更稳）</option>
+              <option value="6" selected>6 页（推荐）</option>
+              <option value="8">8 页（更快）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="bilingualLayout">对照 Word 版式</label>
+            <select id="bilingualLayout">
+              <option value="side">A4 横向左右对照</option>
+            </select>
+          </div>
+        </div>
+        <div class="checks">
+          <label><input id="proofEnabled" type="checkbox" checked />完整处理时，翻译后自动校对</label>
+          <label><input id="trueFootnotes" type="checkbox" checked />章末注和书末注转为 Word 页下注（连续编号）</label>
         </div>
       </div>
-      <div class="row">
-        <div>
-          <label>OCR 语言</label
-          ><select id="ocrLang">
-            <option value="eng">英文 eng</option>
-            <option value="chi_sim+eng">中英 chi_sim+eng</option>
-            <option value="jpn+eng">日英 jpn+eng</option>
-          </select>
-        </div>
-        <div>
-          <label>跨页上下文长度</label
-          ><input
-            id="contextChars"
-            type="number"
-            value="1200"
-            min="0"
-            max="5000"
-          />
-        </div>
-      </div>
-      <div class="row">
-        <div>
-          <label>中文书稿重建批次</label
-          ><select id="manuscriptBatchPages">
-            <option value="4">4 页/批（更稳）</option>
-            <option value="6" selected>6 页/批（推荐）</option>
-            <option value="8">8 页/批（更快）</option>
-          </select>
-        </div>
-        <div>
-          <label>对照版 Word</label
-          ><select id="bilingualLayout">
-            <option value="side">A4 横向左右对照</option>
-          </select>
-        </div>
-      </div>
-      <div class="checks">
-        <label
-          ><input
-            id="proofEnabled"
-            type="checkbox"
-            checked
-          />翻译后自动校对</label
-        ><label
-          ><input
-            id="removeHeaders"
-            type="checkbox"
-            checked
-          />删除重复页眉页脚</label
-        ><label
-          ><input id="showBoxes" type="checkbox" checked />显示文本块边框</label
-        ><label
-          ><input
-            id="skipRefs"
-            type="checkbox"
-          />参考文献页降低翻译优先级</label
-        ><label
-          ><input id="trueFootnotes" type="checkbox" checked />章末/书末注释转为
-          Word 页下注（连续编号）</label
-        >
-      </div>
-      <div class="sep"></div>
-      <div class="muted">
-        v2.7 支持
-        DeepSeek、OpenAI、Claude、Gemini、Qwen、Kimi、OpenRouter，以及任意
-        OpenAI-compatible 接口。API Key
-        按平台分别保存；切换平台不会覆盖其他平台的
-        Key。中文书稿重建继续支持目录层级、噪声清理与真脚注重建。
-      </div>
-      <div
-        style="
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          margin-top: 14px;
-        "
-      >
-        <span id="testResult" class="muted"></span>
-        <div>
-          <button id="testBtn" class="ghost">测试连接</button>
-          <button id="closeModal" class="primary">保存设置</button>
+
+      <div class="modal-foot">
+        <span id="testResult" class="hint"></span>
+        <div class="modal-actions">
+          <button id="testBtn" class="btn">测试连接</button>
+          <button id="closeModal" class="btn primary">完成</button>
         </div>
       </div>
     </div>
   </div>
+
+  <!-- 书稿结构预览 -->
+  <div id="previewModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="previewTitle">
+    <div class="modalbox wide">
+      <div class="modal-head">
+        <h3 id="previewTitle">书稿结构预览</h3>
+      </div>
+      <div id="previewStats" class="preview-stats"></div>
+      <div class="preview-body">
+        <div>
+          <h4>章节</h4>
+          <ol id="previewToc" class="preview-toc"></ol>
+        </div>
+        <div>
+          <h4>注释配对</h4>
+          <div id="previewNotes"></div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <span class="hint">确认章节与注释无误后再导出；有问题可以修改译文后重新重建。</span>
+        <div class="modal-actions">
+          <button id="previewRebuild" class="btn">重新重建</button>
+          <button id="previewClose" class="btn">关闭</button>
+          <button id="previewExport" class="btn primary">导出中文书稿 Word</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 通用信息框 -->
+  <div id="infoModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="infoTitle">
+    <div class="modalbox">
+      <div class="modal-head"><h3 id="infoTitle"></h3></div>
+      <div id="infoBody" class="info-body"></div>
+      <div class="modal-foot">
+        <span></span>
+        <div class="modal-actions">
+          <button id="infoClose" class="btn primary">关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
 
   <script src="vendor/tesseract/tesseract.min.js"></script>
   <script>

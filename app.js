@@ -88,7 +88,6 @@ const persistIds = [
   "proofEnabled",
   "removeHeaders",
   "showBoxes",
-  "skipRefs",
   "trueFootnotes",
   "manuscriptBatchPages",
   "bilingualLayout",
@@ -114,11 +113,17 @@ function progress(i, n, label) {
   $("progressBar").style.width = p + "%";
   $("progressText").textContent = `${label} ${i}/${n} (${p}%)`;
 }
+const STEP_STAGE = {
+  1: "parse",
+  2: "parse",
+  3: "clean",
+  4: "translate",
+  5: "proof",
+  6: "reconstruct",
+};
 function markStep(n) {
-  document.querySelectorAll(".step").forEach((x) => {
-    const k = +x.dataset.step;
-    x.className = "step " + (k < n ? "done" : k === n ? "active" : "");
-  });
+  runner.stage = STEP_STAGE[n] || "";
+  updatePipeline();
 }
 function esc(s = "") {
   return s.replace(
@@ -175,31 +180,11 @@ function syncEditors() {
   p.target = nt;
 }
 function updateMetrics() {
-  const ps = state.pages;
-  $("mParsed").textContent = ps.filter((p) => p.parsed).length;
-  $("mTranslated").textContent = ps.filter((p) => p.translated).length;
-  $("mProofed").textContent = ps.filter((p) => p.proofed).length;
-  $("mApproved").textContent = ps.filter((p) => p.approved).length;
+  updatePipeline();
+  renderPageList();
 }
-function setButtonsForProject({ hasPdf = false, hasTranslation = false } = {}) {
-  for (const id of [
-    "reconstructBtn",
-    "saveProject",
-    "exportHtml",
-    "exportWord",
-  ])
-    $(id).disabled = !hasTranslation;
-  $("exportBilingual").disabled = !state.pages.some(
-    (p) => p.source && p.target,
-  );
-  $("exportBilingualWord").disabled = !state.pages.some(
-    (p) => p.source && p.target,
-  );
-  $("auditBtn").disabled = !hasTranslation;
-  $("proofBtn").disabled = !hasTranslation;
-  $("runBtn").disabled = !hasPdf;
-  $("parseBtn").disabled = !hasPdf;
-  $("translateBtn").disabled = !hasPdf;
+function setButtonsForProject() {
+  updateControls();
 }
 function importedPage(n, source = "", target = "") {
   return {
@@ -215,6 +200,8 @@ function importedPage(n, source = "", target = "") {
     proofed: false,
     approved: false,
     charCount: (source || target || "").length,
+    error: "",
+    errorStage: "",
   };
 }
 function activateImportedProject(name, pages, kind) {
@@ -227,11 +214,13 @@ function activateImportedProject(name, pages, kind) {
   state.pages = pages.map((p, i) =>
     importedPage(Number(p.n) || i + 1, p.source || "", p.target || ""),
   );
-  setButtonsForProject({
-    hasPdf: false,
-    hasTranslation: state.pages.some((p) => p.target.trim()),
-  });
-  markStep(6);
+  state.cleaned = false;
+  setDocument(
+    state.fileName,
+    state.pages.length,
+    kind === "bilingual" ? "双语译文" : "译文",
+  );
+  selectView("text");
   status(
     `已导入已有${kind === "bilingual" ? "双语" : "中文译文"} · ${state.pages.length} 个文本单元，可直接 AI 书稿重建`,
   );
@@ -239,6 +228,7 @@ function activateImportedProject(name, pages, kind) {
     `导入已有${kind === "bilingual" ? "双语" : "译文"}文件，跳过 OCR 与翻译。`,
   );
   showPage(0);
+  updateControls();
 }
 function htmlToImportedPages(html) {
   const doc = new DOMParser().parseFromString(html, "text/html");
@@ -368,8 +358,14 @@ async function loadPdf(file) {
     proofed: false,
     approved: false,
     charCount: 0,
+    error: "",
+    errorStage: "",
   }));
-  setButtonsForProject({ hasPdf: true, hasTranslation: false });
+  state.cleaned = false;
+  state.current = 0;
+  setDocument(file.name, state.pdf.numPages, "PDF");
+  selectView("page");
+  updateControls();
   status(`${file.name} · ${state.pdf.numPages} 页`);
   log(`加载 ${file.name}，共 ${state.pdf.numPages} 页。`);
   await showPage(0);
@@ -404,9 +400,11 @@ function drawBoxes(p, viewport) {
     const d = document.createElement("div");
     d.className = "bbox";
     d.style.left = b.x * sx + "px";
-    d.style.top = (viewport.height - b.y - b.h) * sy + "px";
+    const top = b.top ?? b.y + b.h,
+      bottom = b.bottom ?? b.y;
+    d.style.top = (viewport.height - top) * sy + "px";
     d.style.width = b.w * sx + "px";
-    d.style.height = Math.max(8, b.h * sy) + "px";
+    d.style.height = Math.max(8, (top - bottom) * sy) + "px";
     d.title = b.text.slice(0, 160);
     ov.appendChild(d);
   }
@@ -429,12 +427,19 @@ async function showPage(i) {
         : p.parsed
           ? "已解析"
           : "未处理";
-  $("pageState").textContent = st;
-  $("pageState").className =
-    "pill " +
-    (p.approved || p.proofed || p.translated ? "ok" : p.parsed ? "warn" : "");
+  $("pageState").textContent = p.error ? "出错" : st;
+  $("pageState").className = "pill " + pageStatusClass(p);
+  $("pageError").hidden = !p.error;
+  $("pageError").textContent = p.error || "";
+  $("approveBtn").textContent = p.approved ? "取消检查标记" : "标记已检查";
   $("pageMeta").innerHTML =
     `<span class="chip">${p.layout === "imported" ? "导入文稿" : p.layout === "double" ? "双栏" : p.layout === "single" ? "单栏" : "未判断"}</span><span class="chip">${state.pdf ? (p.ocr ? "OCR" : "文本层") : "跳过 OCR/翻译"}</span><span class="chip">${p.charCount || 0} 字符</span>`;
+  $("noPageImage").hidden = !!state.pdf;
+  $("noPageImage").textContent =
+    "导入的译文没有页面图像，可在“原文”或“逐段对照”中查看文字。";
+  if (currentView === "pairs") renderPairs();
+  updateMetrics();
+  updateControls();
   if (state.pdf) {
     $("canvasWrap").style.display = "flex";
     await renderPage(p.n);
@@ -442,7 +447,6 @@ async function showPage(i) {
     $("canvasWrap").style.display = "none";
     $("overlay").innerHTML = "";
   }
-  updateMetrics();
 }
 function groupLines(items, pageW) {
   const rows = [];
@@ -521,7 +525,16 @@ function rowsToBlocks(rows, pageW, pageH, layout) {
     const minX = Math.min(...r.items.map((i) => i.x)),
       maxX = Math.max(...r.items.map((i) => i.x + i.w)),
       h = Math.max(...r.items.map((i) => i.h));
-    const line = { text, x: minX, y: r.y, w: maxX - minX, h };
+    // top/bottom 为 PDF 坐标中文本块的上下边缘（y 是基线），用于在页面上准确绘制文本块
+    const line = {
+      text,
+      x: minX,
+      y: r.y,
+      w: maxX - minX,
+      h,
+      top: r.y + h * 0.85,
+      bottom: r.y - h * 0.25,
+    };
     const gap = current ? Math.abs(current.lastY - r.y) : 999;
     const sameColumn = current && Math.abs(current.x - line.x) < pageW * 0.12;
     if (current && sameColumn && gap < Math.max(18, h * 1.7)) {
@@ -529,6 +542,8 @@ function rowsToBlocks(rows, pageW, pageH, layout) {
       current.w = Math.max(current.w, line.w);
       current.h += gap || h;
       current.lastY = r.y;
+      current.bottom = Math.min(current.bottom, r.y - h * 0.25);
+      current.x = Math.min(current.x, line.x);
     } else {
       current = { ...line, lastY: r.y };
       blocks.push(current);
@@ -611,13 +626,19 @@ function headerFooterCandidates() {
       .split(/\n+/)
       .map((x) => x.trim())
       .filter(Boolean);
-    for (const s of [...lines.slice(0, 2), ...lines.slice(-2)]) {
+    // 同一页只计一次，避免短页面的首尾两行重叠计数，被误判为跨页重复的页眉页脚
+    const edge = new Set([...lines.slice(0, 2), ...lines.slice(-2)]);
+    for (const s of edge) {
       const n = normalizeHF(s);
       if (n.length < 3 || n.length > 140) continue;
       counts.set(n, (counts.get(n) || 0) + 1);
     }
   }
   const need = Math.max(2, Math.ceil(state.pages.length * 0.35));
+  if (state.pages.length < 3) {
+    state.headerFooter = new Set();
+    return;
+  }
   state.headerFooter = new Set(
     [...counts].filter(([, c]) => c >= need).map(([s]) => s),
   );
@@ -627,15 +648,19 @@ function applyCleanup() {
   markStep(3);
   if ($("removeHeaders").checked) headerFooterCandidates();
   for (const p of state.pages) {
-    let lines = (p.raw || p.source || "").split(/\n+/);
+    // 按单行拆分并保留空行，这样段落之间的空行（段落边界）不会在清洗中丢失
+    let lines = (p.raw || p.source || "").split("\n");
     if ($("removeHeaders").checked)
       lines = lines.filter((s) => {
+        if (!s.trim()) return true;
         const n = normalizeHF(s);
         return !state.headerFooter.has(n) && !/^\s*\d{1,4}\s*$/.test(s);
       });
     p.source = cleanText(lines.join("\n"));
     p.charCount = p.source.length;
   }
+  state.cleaned = true;
+  updatePipeline();
   log("完成断词、空行与重复页眉页脚清理。");
 }
 function splitChunks(text, maxLen) {
@@ -702,7 +727,7 @@ const PROVIDER_PRESETS = {
   custom: {
     base: "",
     model: "",
-    help: "自定义：填写 OpenAI-compatible API Base 与模型 ID。",
+    help: "自定义：填写兼容 OpenAI 接口的 API 地址与模型 ID。",
   },
 };
 function providerName() {
@@ -711,18 +736,16 @@ function providerName() {
 function syncProviderUI() {
   const p = providerName(),
     x = PROVIDER_PRESETS[p] || PROVIDER_PRESETS.custom;
-  $("providerSettings").value = p;
-  $("modelSettings").value = $("model").value;
   $("providerHelp").textContent = x.help;
+  updateEngineCard();
 }
 function applyProviderPreset(p) {
   const x = PROVIDER_PRESETS[p] || PROVIDER_PRESETS.custom;
   $("provider").value = p;
-  $("providerSettings").value = p;
   $("apiBase").value = x.base;
   $("model").value = x.model;
-  $("modelSettings").value = x.model;
   $("providerHelp").textContent = x.help;
+  updateEngineCard();
   refreshKeyStatus();
 }
 async function keyRequest(path, payload = {}) {
@@ -752,11 +775,18 @@ async function refreshKeyStatus() {
     const label =
       $("provider").selectedOptions[0]?.textContent || providerName();
     $("keyStatus").textContent = x.saved
-      ? `${label} Key 已保存到 ${x.storage} ${x.masked}`
+      ? `${label} Key 已保存（${x.storage}，${x.masked}）`
       : `${label} 尚未保存 API Key`;
     $("deleteKeyBtn").disabled = !x.saved;
+    state.keySaved = !!x.saved;
+    $("engineKey").textContent = x.saved
+      ? `Key 已保存 ${x.masked}`
+      : "尚未设置 API Key，点击设置";
+    $("engineCard").classList.toggle("needs-key", !x.saved);
   } catch (e) {
     $("keyStatus").textContent = "无法读取 Key 状态：" + e.message;
+    $("engineKey").textContent = "无法连接本地服务";
+    $("engineCard").classList.add("needs-key");
   }
 }
 async function saveKey() {
@@ -819,6 +849,8 @@ function prevContext(idx) {
 async function translatePage(idx) {
   syncEditors();
   const p = state.pages[idx];
+  if (!p.source.trim() && !state.pdf)
+    throw new Error("这一页没有原文，无法翻译");
   if (!p.source.trim()) await parsePage(idx);
   markStep(4);
   const chunks = splitChunks(p.source, +$("chunkSize").value || 3200),
@@ -852,55 +884,247 @@ async function proofPage(idx) {
   log(`第 ${idx + 1} 页校对完成。`);
   updateMetrics();
 }
-async function runAll() {
-  if (state.busy) return;
-  state.busy = true;
-  $("runBtn").disabled = true;
-  try {
-    for (let i = 0; i < state.pages.length; i++) {
-      await parsePage(i);
-      progress(i + 1, state.pages.length, "版面分析 / OCR");
-    }
-    applyCleanup();
-    for (let i = 0; i < state.pages.length; i++) {
-      await translatePage(i);
-      progress(i + 1, state.pages.length, "翻译");
-    }
-    if ($("proofEnabled").checked)
-      for (let i = 0; i < state.pages.length; i++) {
-        await proofPage(i);
-        progress(i + 1, state.pages.length, "校对");
+// ---------- 批量处理：出错不中断、可暂停、可续跑 ----------
+const runner = { stage: "", pause: false, done: 0, total: 0, times: [] };
+function isFatalError(e) {
+  const m = String(e?.message || e);
+  return /缺少 .*API Key|HTTP 40[13]|登记的地址|会话令牌|API Base 不能为空|模型名称不能为空|无法连接/.test(
+    m,
+  );
+}
+function formatEta(ms) {
+  if (!isFinite(ms) || ms <= 0) return "";
+  const min = Math.round(ms / 60000);
+  if (min < 1) return "预计不到 1 分钟";
+  if (min < 60) return `预计还需约 ${min} 分钟`;
+  return `预计还需约 ${Math.floor(min / 60)} 小时 ${min % 60} 分钟`;
+}
+function updateEta() {
+  const t = runner.times.slice(-8);
+  if (!t.length || runner.done >= runner.total) {
+    $("eta").textContent = "";
+    return;
+  }
+  const avg = t.reduce((x, y) => x + y, 0) / t.length;
+  $("eta").textContent = formatEta(avg * (runner.total - runner.done));
+}
+// 依次处理 indices 中的页面；单页出错记录在页面上并继续，致命错误（如缺少 Key）立即停止
+async function runPages(stage, label, indices, fn) {
+  runner.stage = stage;
+  runner.done = 0;
+  runner.total = indices.length;
+  runner.times = [];
+  updatePipeline();
+  let failed = 0;
+  for (const idx of indices) {
+    if (runner.pause) return { failed, paused: true };
+    const p = state.pages[idx];
+    const t0 = performance.now();
+    try {
+      await fn(idx);
+      if (p.errorStage === stage) {
+        p.error = "";
+        p.errorStage = "";
       }
-    markStep(6);
-    status("完成。建议逐页人工检查后导出。");
-    await showPage(state.current);
-    log("完整处理流程完成。");
+    } catch (e) {
+      if (isFatalError(e)) throw e;
+      failed++;
+      p.error = `${label}失败：${e.message}`;
+      p.errorStage = stage;
+      log(`第 ${p.n} 页${label}失败：${e.message}`);
+    }
+    runner.times.push(performance.now() - t0);
+    runner.done++;
+    progress(runner.done, runner.total, label);
+    updateEta();
+    renderPageList();
+    updatePipeline();
+  }
+  return { failed, paused: false };
+}
+function setBusy(on) {
+  state.busy = on;
+  runner.pause = false;
+  $("pauseBtn").hidden = !on;
+  $("pauseBtn").disabled = false;
+  $("pauseBtn").textContent = "处理完当前页后暂停";
+  if (!on) {
+    runner.stage = "";
+    $("eta").textContent = "";
+  }
+  updateControls();
+  updatePipeline();
+}
+function handleFatal(e) {
+  status("处理已停止");
+  log("错误：" + e.message);
+  if (/缺少 .*API Key/.test(e.message))
+    openSettings(
+      "ai",
+      `还没有设置 ${PROVIDER_LABELS[providerName()] || "当前平台"} 的 API Key。填写并保存后，点击“继续完整处理”即可从中断处继续。`,
+    );
+  else if (/HTTP 401/.test(e.message))
+    openSettings(
+      "ai",
+      "API Key 无效或已过期（平台返回 401），请检查后重新保存。",
+    );
+  else if (/Key|登记的地址|API Base|模型名称/.test(e.message))
+    openSettings("ai", e.message);
+  else notify(e.message, "error");
+}
+async function stageParse() {
+  const todo = state.pages
+    .map((p, i) => i)
+    .filter((i) => !state.pages[i].parsed);
+  const r = await runPages("parse", "解析", todo, (i) => parsePage(i));
+  if (todo.length && !r.paused) applyCleanup();
+  return r;
+}
+async function stageTranslate() {
+  const todo = state.pages
+    .map((p, i) => i)
+    .filter(
+      (i) =>
+        !state.pages[i].translated &&
+        (state.pdf || state.pages[i].source.trim()),
+    );
+  return runPages("translate", "翻译", todo, (i) => translatePage(i));
+}
+async function stageProof() {
+  const todo = state.pages
+    .map((p, i) => i)
+    .filter((i) => state.pages[i].translated && !state.pages[i].proofed);
+  return runPages("proof", "校对", todo, (i) => proofPage(i));
+}
+function finishRun(results, doneMsg) {
+  const failed = results.reduce((n, r) => n + (r?.failed || 0), 0);
+  const paused = results.some((r) => r?.paused);
+  if (paused) {
+    status("已暂停。再次点击“完整处理”会从中断处继续。");
+    log("处理已暂停。");
+  } else if (failed) {
+    status(
+      `${failed} 页出错，可点击“重试出错页”，或在页面列表中筛选“出错”查看。`,
+    );
+    notify(`${failed} 页处理出错，其余页面已完成`, "error");
+  } else status(doneMsg);
+}
+async function runAll() {
+  if (state.busy || !state.pdf) return;
+  syncEditors();
+  setBusy(true);
+  const results = [];
+  try {
+    results.push(await stageParse());
+    if (!results.at(-1).paused) results.push(await stageTranslate());
+    if (!results.at(-1).paused && $("proofEnabled").checked)
+      results.push(await stageProof());
+    finishRun(results, "完整处理完成。建议逐页检查后导出。");
+    if (!results.some((r) => r.paused)) log("完整处理流程完成。");
   } catch (e) {
-    status("处理失败");
-    log("错误：" + e.message);
-    alert(e.message);
+    handleFatal(e);
   } finally {
-    state.busy = false;
-    $("runBtn").disabled = false;
+    setBusy(false);
+    await showPage(state.current);
+  }
+}
+async function runStage(stage) {
+  if (state.busy) return;
+  syncEditors();
+  if (stage === "approve") {
+    const i = state.pages.findIndex((p) => p.translated && !p.approved);
+    $("pageFilter").value = "unapproved";
+    renderPageList();
+    if (i >= 0) showPage(i);
+    else notify("所有已翻译的页面都已检查");
+    return;
+  }
+  if (stage === "reconstruct") {
+    try {
+      await reconstructBook(true);
+      openPreview();
+    } catch (e) {
+      status("书稿重建失败");
+      notify(e.message, "error");
+    }
+    return;
+  }
+  if (stage === "clean") {
+    applyCleanup();
+    await showPage(state.current);
+    return;
+  }
+  setBusy(true);
+  try {
+    const fn = {
+      parse: stageParse,
+      translate: stageTranslate,
+      proof: stageProof,
+    }[stage];
+    const r = await fn();
+    finishRun(
+      [r],
+      { parse: "解析完成。", translate: "翻译完成。", proof: "校对完成。" }[
+        stage
+      ],
+    );
+  } catch (e) {
+    handleFatal(e);
+  } finally {
+    setBusy(false);
+    await showPage(state.current);
+  }
+}
+async function retryErrors() {
+  if (state.busy) return;
+  const byStage = { parse: [], translate: [], proof: [] };
+  state.pages.forEach((p, i) => p.error && byStage[p.errorStage]?.push(i));
+  setBusy(true);
+  const results = [];
+  try {
+    if (byStage.parse.length)
+      results.push(
+        await runPages("parse", "解析", byStage.parse, (i) => parsePage(i)),
+      );
+    if (byStage.translate.length && !results.some((r) => r.paused))
+      results.push(
+        await runPages("translate", "翻译", byStage.translate, (i) =>
+          translatePage(i),
+        ),
+      );
+    if (byStage.proof.length && !results.some((r) => r.paused))
+      results.push(
+        await runPages("proof", "校对", byStage.proof, (i) => proofPage(i)),
+      );
+    finishRun(results, "出错页已全部重新处理完成。");
+  } catch (e) {
+    handleFatal(e);
+  } finally {
+    setBusy(false);
+    await showPage(state.current);
   }
 }
 async function auditAll() {
   syncEditors();
   if (!state.pages.some((p) => p.translated)) {
-    alert("请先完成翻译");
+    notify("请先完成翻译");
     return;
   }
+  $("auditBtn").disabled = true;
   try {
-    status("正在做全文术语一致性检查…");
+    status("正在检查全文术语一致性…");
     const sample = state.pages
-      .map((p, i) => `[P${i + 1}]\n${p.target}`)
+      .map((p, i) => `[P${p.n}]\n${p.target}`)
       .join("\n\n")
       .slice(0, 40000);
     const out = await apiCall("audit", sample, "");
-    alert(out);
-    status("一致性检查完成（结果已弹出）");
+    showInfo("全文术语检查", out);
+    status("术语检查完成。");
   } catch (e) {
-    alert(e.message);
+    if (isFatalError(e)) handleFatal(e);
+    else notify(e.message, "error");
+  } finally {
+    updateControls();
   }
 }
 const manuscriptTypes = new Set([
@@ -1084,8 +1308,9 @@ async function reconstructBook(force = false) {
     return state.manuscript;
   } finally {
     state.busy = false;
-    $("reconstructBtn").disabled = false;
     $("reconstructBtn").textContent = old;
+    updateControls();
+    updatePipeline();
   }
 }
 function download(name, blob) {
@@ -1113,21 +1338,30 @@ function makeHTML(bilingual = false) {
 }
 async function exportWord(mode = "translated") {
   syncEditors();
+  closeExportMenu();
   if (!state.pages.some((p) => p.target && p.target.trim())) {
-    alert("没有可导出的译文");
+    notify("没有可导出的译文");
     return;
   }
-  const btn = mode === "bilingual" ? $("exportBilingualWord") : $("exportWord");
-  const old = btn.textContent;
+  if (mode !== "bilingual") {
+    try {
+      await reconstructBook(false);
+      openPreview();
+    } catch (e) {
+      status("书稿重建失败");
+      if (isFatalError(e)) handleFatal(e);
+      else notify(e.message, "error");
+    }
+    return;
+  }
+  await downloadDocx("bilingual");
+}
+async function downloadDocx(mode) {
+  const btn = $("exportMenuBtn");
   btn.disabled = true;
-  btn.textContent = mode === "bilingual" ? "正在生成…" : "正在重建书稿…";
   try {
-    let manuscript = null;
-    if (mode !== "bilingual") manuscript = await reconstructBook(false);
     status(
-      mode === "bilingual"
-        ? "正在生成原文译文对照 Word…"
-        : "正在生成可直接阅读的中文书稿 Word…",
+      mode === "bilingual" ? "正在生成对照 Word…" : "正在生成中文书稿 Word…",
     );
     const payload = {
       mode: mode === "bilingual" ? "bilingual" : "manuscript",
@@ -1138,7 +1372,7 @@ async function exportWord(mode = "translated") {
         source: p.source,
         target: p.target,
       })),
-      manuscript,
+      manuscript: mode === "bilingual" ? null : state.manuscript,
       true_footnotes: $("trueFootnotes").checked,
     };
     const r = await apiFetch("/api/export-docx", {
@@ -1153,22 +1387,22 @@ async function exportWord(mode = "translated") {
       } catch {}
       throw new Error(msg || `HTTP ${r.status}`);
     }
-    const blob = await r.blob();
     download(
       base() +
         (mode === "bilingual" ? "_原文译文对照版.docx" : "_中文书稿版.docx"),
-      blob,
+      await r.blob(),
     );
-    status("Word 已生成并开始下载。");
-    log(
-      `已导出${mode === "bilingual" ? "原文译文对照" : "中文正式书稿"} Word。`,
+    status("Word 已生成，开始下载。");
+    notify(
+      mode === "bilingual" ? "对照 Word 已导出" : "中文书稿 Word 已导出",
+      "ok",
     );
+    log(`已导出${mode === "bilingual" ? "原文译文对照" : "中文书稿"} Word。`);
   } catch (e) {
     status("Word 导出失败");
-    alert("Word 导出失败：" + e.message);
+    notify("Word 导出失败：" + e.message, "error");
   } finally {
-    btn.disabled = false;
-    btn.textContent = old;
+    updateControls();
   }
 }
 function exportProject() {
@@ -1216,19 +1450,391 @@ function exportProject() {
     }),
   );
 }
-$("file").onchange = (e) => e.target.files[0] && loadPdf(e.target.files[0]);
-$("importBtn").onclick = async () => {
-  try {
-    await importExisting($("importFile").files[0]);
-  } catch (e) {
-    status("导入失败");
-    alert("导入已有译文失败：" + e.message);
-  }
+
+// ---------- 界面：文档、页面列表、视图、流程条、提示 ----------
+let currentView = "page";
+const PROVIDER_LABELS = {
+  deepseek: "DeepSeek",
+  openai: "OpenAI",
+  anthropic: "Anthropic Claude",
+  gemini: "Google Gemini",
+  qwen: "Alibaba Qwen",
+  kimi: "Moonshot Kimi",
+  openrouter: "OpenRouter",
+  custom: "自定义接口",
 };
-$("importFile").onchange = () => {
-  $("importHint").textContent = $("importFile").files[0]
-    ? `已选择：${$("importFile").files[0].name}。点击“导入已有译文”。`
-    : "双语文件优先：保留原文用于结构判断；纯译文也可直接生成中文书稿。";
+function notify(msg, kind = "info") {
+  const t = document.createElement("div");
+  t.className = "toast " + kind;
+  t.textContent = msg;
+  t.setAttribute("role", kind === "error" ? "alert" : "status");
+  const close = () => t.remove();
+  t.onclick = close;
+  $("toasts").appendChild(t);
+  setTimeout(close, kind === "error" ? 9000 : 3500);
+}
+function showInfo(title, text) {
+  $("infoTitle").textContent = title;
+  $("infoBody").textContent = text;
+  openModal("infoModal");
+}
+function openModal(id) {
+  $(id).classList.add("open");
+  const f = $(id).querySelector("button.primary, input, select");
+  setTimeout(() => f?.focus(), 30);
+}
+function closeModal(id) {
+  $(id).classList.remove("open");
+}
+function setDocument(name, count, kind) {
+  $("docTitle").textContent =
+    `${name} · ${count} ${kind === "PDF" ? "页" : "个文本单元"}`;
+  $("docTitle").title = name;
+  $("fileInfo").hidden = false;
+  $("fileInfo").textContent = `${kind}：${name}`;
+}
+function pageStatusClass(p) {
+  if (p.error) return "s-error";
+  if (p.approved) return "s-approved";
+  if (p.proofed) return "s-proofed";
+  if (p.translated) return "s-translated";
+  if (p.parsed) return "s-parsed";
+  return "s-none";
+}
+function pageStatusText(p) {
+  if (p.error) return "出错";
+  if (p.approved) return "已检查";
+  if (p.proofed) return "已校对";
+  if (p.translated) return "已翻译";
+  if (p.parsed) return "已解析";
+  return "未处理";
+}
+const PAGE_FILTERS = {
+  all: () => true,
+  todo: (p) => !p.translated,
+  unproofed: (p) => p.translated && !p.proofed,
+  unapproved: (p) => p.translated && !p.approved,
+  error: (p) => !!p.error,
+};
+function renderPageList() {
+  const list = $("pageList");
+  const f = PAGE_FILTERS[$("pageFilter").value] || PAGE_FILTERS.all;
+  const frag = document.createDocumentFragment();
+  let shown = 0;
+  state.pages.forEach((p, i) => {
+    if (!f(p)) return;
+    shown++;
+    const li = document.createElement("li");
+    const b = document.createElement("button");
+    b.className =
+      "page-item " +
+      pageStatusClass(p) +
+      (i === state.current ? " current" : "");
+    b.dataset.index = i;
+    b.title = `第 ${p.n} 页 · ${pageStatusText(p)}${p.error ? "：" + p.error : ""}`;
+    b.innerHTML = `<i class="dot"></i><span>${p.n}</span>`;
+    li.appendChild(b);
+    frag.appendChild(li);
+  });
+  list.replaceChildren(frag);
+  if (state.pages.length && !shown) {
+    const li = document.createElement("li");
+    li.className = "rail-empty";
+    li.textContent = "没有符合条件的页面";
+    list.appendChild(li);
+  }
+  list.querySelector(".current")?.scrollIntoView({ block: "nearest" });
+}
+function pct(a, b) {
+  return b ? Math.round((a / b) * 100) : 0;
+}
+function updatePipeline() {
+  const ps = state.pages,
+    n = ps.length;
+  const c = (f) => ps.filter(f).length;
+  const parsed = c((p) => p.parsed),
+    translated = c((p) => p.translated),
+    proofed = c((p) => p.proofed),
+    approved = c((p) => p.approved);
+  const set = (key, text, percent) => {
+    $("c" + key).textContent = text;
+    $("b" + key).style.width = percent + "%";
+  };
+  set("Parse", `${parsed}/${n}`, pct(parsed, n));
+  set("Clean", state.cleaned ? "已完成" : "未进行", state.cleaned ? 100 : 0);
+  set("Translate", `${translated}/${n}`, pct(translated, n));
+  set("Proof", `${proofed}/${n}`, pct(proofed, n));
+  const blocks = state.manuscript?.blocks?.length || 0;
+  set(
+    "Reconstruct",
+    blocks ? `${blocks} 个结构块` : "未进行",
+    blocks ? 100 : 0,
+  );
+  set("Approve", `${approved}/${n}`, pct(approved, n));
+  document.querySelectorAll(".stage").forEach((el) => {
+    el.classList.toggle(
+      "running",
+      state.busy && el.dataset.stage === runner.stage,
+    );
+    const done = {
+      parse: n && parsed === n,
+      clean: state.cleaned,
+      translate: n && translated === n,
+      proof: n && proofed === n,
+      reconstruct: !!blocks,
+      approve: n && approved === n,
+    }[el.dataset.stage];
+    el.classList.toggle("done", !!done);
+  });
+  const errors = c((p) => p.error);
+  $("retryBtn").hidden = !errors || state.busy;
+  $("retryBtn").textContent = `重试出错页（${errors}）`;
+}
+function updateControls() {
+  const has = state.pages.length > 0,
+    pdf = !!state.pdf,
+    busy = !!state.busy;
+  const hasTarget = state.pages.some((p) => p.target && p.target.trim());
+  const hasPairs = state.pages.some((p) => p.source && p.target);
+  const canTranslate = pdf || state.pages.some((p) => p.source.trim());
+  const cur = state.pages[state.current];
+  const dis = (id, v) => ($(id).disabled = v);
+  dis("runBtn", !pdf || busy);
+  dis("auditBtn", !hasTarget || busy);
+  dis("reconstructBtn", !hasTarget || busy);
+  dis("exportMenuBtn", !hasTarget || busy);
+  dis("exportWord", !hasTarget);
+  dis("exportHtml", !hasTarget);
+  dis("saveProject", !has);
+  dis("exportBilingual", !hasPairs);
+  dis("exportBilingualWord", !hasPairs);
+  dis("parseBtn", !pdf || busy);
+  dis("translateBtn", !canTranslate || busy || !cur);
+  dis("proofBtn", !cur?.target?.trim() || busy);
+  dis("approveBtn", !cur?.target?.trim());
+  const stageOk = {
+    parse: pdf,
+    clean: pdf && state.pages.some((p) => p.parsed),
+    translate: canTranslate,
+    proof: hasTarget,
+    reconstruct: hasTarget,
+    approve: hasTarget,
+  };
+  document.querySelectorAll(".stage").forEach((el) => {
+    el.disabled = busy || !stageOk[el.dataset.stage];
+  });
+  $("runBtn").textContent =
+    pdf &&
+    state.pages.some((p) => p.parsed || p.translated) &&
+    state.pages.some(
+      (p) => !p.translated || ($("proofEnabled").checked && !p.proofed),
+    )
+      ? "继续完整处理"
+      : "完整处理";
+}
+function selectView(v) {
+  if (v !== currentView) syncEditors();
+  currentView = v;
+  document.querySelectorAll(".source-pane .tab").forEach((t) => {
+    t.classList.toggle("active", t.dataset.view === v);
+    t.setAttribute("aria-selected", t.dataset.view === v);
+  });
+  document.querySelectorAll(".source-pane .view").forEach((el) => {
+    el.hidden = el.dataset.view !== v;
+  });
+  if (v === "pairs") renderPairs();
+}
+function splitParas(t) {
+  return (t || "")
+    .split(/\n\s*\n/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+function renderPairs() {
+  const p = state.pages[state.current];
+  const box = $("pairView");
+  if (!p) {
+    box.innerHTML =
+      '<p class="empty">打开文档后，这里按段落并排显示原文和译文。</p>';
+    return;
+  }
+  const a = splitParas(p.source),
+    b = splitParas(p.target);
+  const rows = Math.max(a.length, b.length);
+  let html = "";
+  if (a.length && b.length && a.length !== b.length)
+    html += `<p class="pair-note">原文 ${a.length} 段，译文 ${b.length} 段，段落没有一一对应，请留意漏译或合并。</p>`;
+  for (let i = 0; i < rows; i++)
+    html += `<div class="pair"><span class="pair-no">${i + 1}</span><div class="pair-src">${esc(a[i] || "")}</div><div class="pair-tgt${b[i] ? "" : " missing"}">${esc(b[i] || (a[i] ? "（无对应译文）" : ""))}</div></div>`;
+  box.innerHTML = html || '<p class="empty">这一页还没有文字。</p>';
+}
+function updateEngineCard() {
+  const p = providerName();
+  $("engineName").textContent = PROVIDER_LABELS[p] || p;
+  $("engineModel").textContent = $("model").value || "未填写模型";
+}
+function openSettings(tab = "ai", notice = "") {
+  selectSettingsTab(tab);
+  $("settingsNotice").hidden = !notice;
+  $("settingsNotice").textContent = notice;
+  openModal("modal");
+  refreshKeyStatus();
+}
+function selectSettingsTab(tab) {
+  document.querySelectorAll("[data-settings-tab]").forEach((el) => {
+    if (el.classList.contains("tab"))
+      el.classList.toggle("active", el.dataset.settingsTab === tab);
+    else el.hidden = el.dataset.settingsTab !== tab;
+  });
+}
+function noteKey(scope, id) {
+  scope = String(scope || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-");
+  id = String(id || "").trim();
+  return scope && id ? `${scope}:${id}` : "";
+}
+const HEADING_TYPES = {
+  book_title: 0,
+  preface_title: 1,
+  part: 1,
+  chapter: 1,
+  appendix: 1,
+  section: 2,
+  subsection: 3,
+};
+function openPreview() {
+  const blocks = state.manuscript?.blocks || [];
+  const anchors = new Set(),
+    notes = new Map();
+  for (const b of blocks) {
+    if (b.type === "footnote")
+      notes.set(noteKey(b.note_scope, b.note_id), b.text);
+    else
+      for (const m of b.text.matchAll(/\[\[FN:([^:\]\n]+):([^\]\n]+)\]\]/g))
+        anchors.add(noteKey(m[1], m[2]));
+  }
+  notes.delete("");
+  const matched = [...anchors].filter((k) => notes.has(k));
+  const noNote = [...anchors].filter((k) => !notes.has(k));
+  const noAnchor = [...notes.keys()].filter((k) => !anchors.has(k));
+  const headings = blocks.filter((b) => b.type in HEADING_TYPES);
+  const body = blocks.filter((b) => b.type === "body").length;
+  $("previewStats").innerHTML = [
+    ["结构块", blocks.length],
+    ["标题", headings.length],
+    ["正文段落", body],
+    ["注号", anchors.size],
+    ["注释", notes.size],
+    ["已配对", matched.length],
+  ]
+    .map(([k, v]) => `<div class="stat"><b>${v}</b><span>${k}</span></div>`)
+    .join("");
+  $("previewToc").innerHTML = headings.length
+    ? headings
+        .map(
+          (h) =>
+            `<li class="lv${HEADING_TYPES[h.type]}"><span>${esc(h.text.replace(/\[\[FN:[^\]]+\]\]/g, ""))}</span>${h.page ? `<em>p.${h.page}</em>` : ""}</li>`,
+        )
+        .join("")
+    : '<li class="empty">没有识别到章节标题，导出的 Word 将没有目录层级。</li>';
+  const list = (arr, label) =>
+    arr.length
+      ? `<p class="warn-text">${label}（${arr.length}）</p><ul class="key-list">${arr
+          .slice(0, 30)
+          .map((k) => `<li>${esc(k)}</li>`)
+          .join(
+            "",
+          )}${arr.length > 30 ? `<li>…另有 ${arr.length - 30} 条</li>` : ""}</ul>`
+      : "";
+  $("previewNotes").innerHTML =
+    (anchors.size || notes.size
+      ? `<p>${matched.length} 个注号找到了对应注释${$("trueFootnotes").checked ? "，导出时转为 Word 页下注" : ""}。</p>`
+      : "<p>没有识别到注释。</p>") +
+    list(noNote, "有注号但缺少注释") +
+    list(noAnchor, "有注释但正文中找不到注号");
+  openModal("previewModal");
+}
+function closeExportMenu() {
+  $("exportMenu").hidden = true;
+  $("exportMenuBtn").setAttribute("aria-expanded", "false");
+}
+async function handleFile(f) {
+  if (!f) return;
+  const ext = (f.name.split(".").pop() || "").toLowerCase();
+  if (state.busy) {
+    notify("正在处理中，请先暂停当前任务");
+    return;
+  }
+  if (
+    state.pages.some((p) => p.translated) &&
+    !confirm("打开新文件会替换当前项目，未导出的译文将丢失。继续吗？")
+  )
+    return;
+  try {
+    if (ext === "pdf" || f.type === "application/pdf") await loadPdf(f);
+    else await importExisting(f);
+  } catch (e) {
+    status("打开文件失败");
+    notify("打开文件失败：" + e.message, "error");
+  }
+}
+function isTyping(e) {
+  const t = e.target;
+  return t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName);
+}
+async function guarded(fn) {
+  try {
+    await fn();
+  } catch (e) {
+    if (isFatalError(e)) handleFatal(e);
+    else notify(e.message, "error");
+  } finally {
+    updateControls();
+    updatePipeline();
+    renderPageList();
+  }
+}
+async function translateCurrent() {
+  const p = state.pages[state.current];
+  if (!p || state.busy) return;
+  state.busy = true;
+  updateControls();
+  try {
+    await translatePage(state.current);
+    p.error = "";
+  } finally {
+    state.busy = false;
+    await showPage(state.current);
+  }
+}
+async function proofCurrent() {
+  const p = state.pages[state.current];
+  if (!p || state.busy) return;
+  state.busy = true;
+  updateControls();
+  try {
+    await proofPage(state.current);
+  } finally {
+    state.busy = false;
+    await showPage(state.current);
+  }
+}
+function toggleApproved(next = false) {
+  syncEditors();
+  const p = state.pages[state.current];
+  if (!p?.target?.trim()) return;
+  p.approved = !p.approved;
+  if (next && p.approved && state.current < state.pages.length - 1)
+    showPage(state.current + 1);
+  else showPage(state.current);
+}
+
+// ---------- 事件绑定 ----------
+$("file").onchange = (e) => {
+  handleFile(e.target.files[0]);
+  e.target.value = "";
 };
 const drop = $("drop");
 drop.ondragover = (e) => {
@@ -1239,125 +1845,213 @@ drop.ondragleave = () => drop.classList.remove("drag");
 drop.ondrop = (e) => {
   e.preventDefault();
   drop.classList.remove("drag");
-  const f = e.dataTransfer.files[0];
-  if (f?.type === "application/pdf") loadPdf(f);
+  handleFile(e.dataTransfer.files[0]);
+};
+drop.onkeydown = (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    $("file").click();
+  }
 };
 $("prev").onclick = () => showPage(state.current - 1);
 $("next").onclick = () => showPage(state.current + 1);
+$("pageList").onclick = (e) => {
+  const b = e.target.closest(".page-item");
+  if (b) showPage(+b.dataset.index);
+};
+$("pageFilter").onchange = renderPageList;
+document
+  .querySelectorAll(".source-pane .tab")
+  .forEach((t) => (t.onclick = () => selectView(t.dataset.view)));
+document
+  .querySelectorAll(".stage")
+  .forEach((el) => (el.onclick = () => runStage(el.dataset.stage)));
 $("runBtn").onclick = runAll;
-$("parseBtn").onclick = async () => {
-  try {
+$("pauseBtn").onclick = () => {
+  runner.pause = true;
+  $("pauseBtn").disabled = true;
+  $("pauseBtn").textContent = "正在暂停…";
+};
+$("retryBtn").onclick = retryErrors;
+$("parseBtn").onclick = () =>
+  guarded(async () => {
+    state.pages[state.current].parsed = false;
     await parsePage(state.current);
-  } catch (e) {
-    alert(e.message);
-  }
-};
-$("translateBtn").onclick = async () => {
-  try {
-    await translatePage(state.current);
-    await showPage(state.current);
-  } catch (e) {
-    alert(e.message);
-  }
-};
-$("proofBtn").onclick = async () => {
-  try {
-    await proofPage(state.current);
-    await showPage(state.current);
-  } catch (e) {
-    alert(e.message);
-  }
-};
+  });
+$("translateBtn").onclick = () => guarded(translateCurrent);
+$("proofBtn").onclick = () => guarded(proofCurrent);
+$("approveBtn").onclick = () => toggleApproved(false);
 $("auditBtn").onclick = auditAll;
-$("reconstructBtn").onclick = async () => {
-  try {
-    await reconstructBook(true);
-  } catch (e) {
-    status("书稿重建失败");
-    alert(e.message);
-  }
+$("reconstructBtn").onclick = () => runStage("reconstruct");
+$("exportMenuBtn").onclick = (e) => {
+  e.stopPropagation();
+  const open = $("exportMenu").hidden;
+  $("exportMenu").hidden = !open;
+  $("exportMenuBtn").setAttribute("aria-expanded", String(open));
+  if (open) $("exportMenu").querySelector("button:not(:disabled)")?.focus();
 };
-$("approveBtn").onclick = () => {
-  syncEditors();
-  state.pages[state.current].approved = true;
-  showPage(state.current);
-};
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".menu")) closeExportMenu();
+});
 $("exportWord").onclick = () => exportWord("translated");
-$("exportBilingualWord").onclick = () => exportWord("bilingual");
-$("saveProject").onclick = exportProject;
-$("exportHtml").onclick = () =>
+$("exportBilingualWord").onclick = () => {
+  closeExportMenu();
+  exportWord("bilingual");
+};
+$("saveProject").onclick = () => {
+  closeExportMenu();
+  exportProject();
+};
+$("exportHtml").onclick = () => {
+  closeExportMenu();
   download(
     base() + "_translated.html",
     new Blob([makeHTML(false)], { type: "text/html;charset=utf-8" }),
   );
-$("exportBilingual").onclick = () =>
+};
+$("exportBilingual").onclick = () => {
+  closeExportMenu();
   download(
     base() + "_bilingual.html",
     new Blob([makeHTML(true)], { type: "text/html;charset=utf-8" }),
   );
+};
+$("previewExport").onclick = async () => {
+  closeModal("previewModal");
+  await downloadDocx("manuscript");
+};
+$("previewRebuild").onclick = async () => {
+  closeModal("previewModal");
+  await runStage("reconstruct");
+};
+$("previewClose").onclick = () => closeModal("previewModal");
+$("infoClose").onclick = () => closeModal("infoModal");
 $("provider").onchange = () => applyProviderPreset($("provider").value);
-$("model").oninput = () => {
-  $("modelSettings").value = $("model").value;
-};
-$("providerSettings").onchange = () =>
-  applyProviderPreset($("providerSettings").value);
-$("modelSettings").oninput = () => {
-  $("model").value = $("modelSettings").value;
-};
-$("settingsBtn").onclick = () => {
-  $("modal").classList.add("open");
-  syncProviderUI();
-  refreshKeyStatus();
-};
+$("model").oninput = updateEngineCard;
+$("settingsBtn").onclick = () => openSettings("ai");
+$("engineCard").onclick = () => openSettings("ai");
+document
+  .querySelectorAll(".tab[data-settings-tab]")
+  .forEach((t) => (t.onclick = () => selectSettingsTab(t.dataset.settingsTab)));
 $("closeModal").onclick = async () => {
   try {
-    $("provider").value = $("providerSettings").value;
-    $("model").value = $("modelSettings").value;
     saveSettings();
     if ($("apiKey").value.trim()) await saveKey();
-    $("modal").classList.remove("open");
-    showPage(state.current);
+    closeModal("modal");
+    updateEngineCard();
+    updateControls();
+    if (state.pages.length) showPage(state.current);
   } catch (e) {
-    alert("保存设置失败：" + e.message);
+    notify("保存设置失败：" + e.message, "error");
   }
 };
 $("saveKeyBtn").onclick = async () => {
   try {
     if (!$("apiKey").value.trim()) {
-      alert("请先输入当前平台 API Key");
+      notify("请先输入 API Key");
       return;
     }
     await saveKey();
+    await refreshKeyStatus();
+    notify("Key 已保存", "ok");
   } catch (e) {
-    alert(e.message);
+    notify(e.message, "error");
   }
 };
 $("deleteKeyBtn").onclick = async () => {
   try {
     await deleteKey();
   } catch (e) {
-    alert(e.message);
+    notify(e.message, "error");
   }
 };
 $("testBtn").onclick = async () => {
   try {
-    $("testResult").textContent = "测试中…";
+    $("testResult").textContent = "正在测试…";
     const x = await apiCall("ping", "Hello");
-    $("testResult").textContent = "连接成功：" + x.slice(0, 80);
+    $("testResult").textContent = "连接成功：" + x.slice(0, 60);
   } catch (e) {
     $("testResult").textContent = "连接失败：" + e.message;
   }
 };
 $("clearBtn").onclick = () => {
-  if (confirm("清空当前项目？")) location.reload();
+  if (confirm("清空当前项目？未导出的译文将丢失。")) location.reload();
 };
+$("shortcutsBtn").onclick = showShortcuts;
+function showShortcuts() {
+  showInfo(
+    "快捷键",
+    [
+      "Alt + ← / →　上一页 / 下一页",
+      "Ctrl（⌘）+ Enter　翻译本页",
+      "Ctrl（⌘）+ Shift + Enter　标记本页已检查并进入下一页",
+      "Ctrl（⌘）+ S　保存项目",
+      "?　显示本说明（不在输入框中时）",
+      "Esc　关闭对话框或菜单",
+    ].join("\n"),
+  );
+}
+for (const m of ["modal", "previewModal", "infoModal"])
+  $(m).addEventListener("mousedown", (e) => {
+    if (e.target === $(m)) closeModal(m);
+  });
+document.addEventListener("keydown", (e) => {
+  const mod = e.ctrlKey || e.metaKey;
+  if (e.key === "Escape") {
+    closeExportMenu();
+    for (const m of ["infoModal", "previewModal", "modal"])
+      if ($(m).classList.contains("open")) {
+        closeModal(m);
+        break;
+      }
+    return;
+  }
+  if (e.altKey && e.key === "ArrowLeft") {
+    e.preventDefault();
+    showPage(state.current - 1);
+  } else if (e.altKey && e.key === "ArrowRight") {
+    e.preventDefault();
+    showPage(state.current + 1);
+  } else if (mod && e.key === "Enter" && e.shiftKey) {
+    e.preventDefault();
+    toggleApproved(true);
+  } else if (mod && e.key === "Enter") {
+    e.preventDefault();
+    if (!$("translateBtn").disabled) guarded(translateCurrent);
+  } else if (mod && (e.key === "s" || e.key === "S")) {
+    if (state.pages.length) {
+      e.preventDefault();
+      exportProject();
+    }
+  } else if (e.key === "?" && !isTyping(e)) {
+    showShortcuts();
+  }
+});
 for (const id of ["sourceEditor", "targetEditor"])
-  $(id).addEventListener("input", () => (editorsDirty = true));
+  $(id).addEventListener("input", () => {
+    editorsDirty = true;
+    state.manuscript = null;
+  });
+$("targetEditor").addEventListener("blur", () => {
+  syncEditors();
+  updateControls();
+  if (currentView === "pairs") renderPairs();
+});
+
 loadSettings();
 if (location.protocol.startsWith("http")) $("backend").value = location.origin;
 if (!$("provider").value) $("provider").value = "deepseek";
-$("providerSettings").value = $("provider").value;
-$("modelSettings").value = $("model").value;
 syncProviderUI();
-window.addEventListener("beforeunload", saveSettings);
+updateEngineCard();
+updatePipeline();
+updateControls();
+renderPairs();
+$("canvasWrap").style.display = "none";
+$("noPageImage").hidden = false;
+$("noPageImage").textContent =
+  "在左侧打开 PDF 后，这里显示页面和识别出的文本块。";
+window.addEventListener("beforeunload", (e) => {
+  saveSettings();
+  if (state.pages.some((p) => p.translated)) e.preventDefault();
+});
 setTimeout(refreshKeyStatus, 300);
