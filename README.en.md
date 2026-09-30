@@ -14,6 +14,8 @@ Most AI translation workflows stop once each sentence has been translated. For l
   <img src="ui-overview.png" width="90%" alt="Scholar PDF Translator interface: settings on the left, source page in the middle, editable translation on the right">
 </p>
 
+The interface follows the processing pipeline. The stage bar at the top shows progress for parsing, cleanup, translation, proofreading, manuscript reconstruction and human review, and each stage can be run on its own. A full run can be paused and resumed without re-sending finished pages to the model; a failing page is flagged instead of stopping the whole book, and failed pages can be retried in one click. The page list marks every page's status and can be filtered to untranslated, unproofed, unreviewed or failed pages. The source can be viewed as the page image with detected text blocks, as editable text, or side by side with the translation paragraph by paragraph. Before a manuscript is exported, a preview lists the detected chapter tree and flags notes that could not be paired. Keyboard shortcuts: `Alt+←/→` to change page, `Ctrl/⌘+Enter` to translate the page, `Ctrl/⌘+Shift+Enter` to mark it reviewed and move on, `?` for the full list. Dark mode follows the system setting.
+
 ## Before and after
 
 Raw machine translation of a scanned book often leaves the structure broken: download metadata mixed with the copyright page, a table of contents half translated, inconsistent heading levels.
