@@ -20,7 +20,7 @@ jobs:
           set -euo pipefail
           mkdir -p assets/comparison
           for name in before-ai-raw-1 before-ai-raw-2 after-cover after-toc after-preface; do
-            cat image-staging/$name/*.part | base64 --decode > assets/comparison/$name.webp
+            cat image-staging/$name/*.part | base64 --decode > assets/comparison/$name.png
           done
 
       - name: Update README image paths
@@ -30,15 +30,15 @@ jobs:
           p = Path("README.md")
           s = p.read_text(encoding="utf-8")
           for name in ["before-ai-raw-1","before-ai-raw-2","after-cover","after-toc","after-preface"]:
-              s = s.replace(f"assets/comparison/{name}.png", f"assets/comparison/{name}.webp")
-              s = s.replace(f"assets/comparison/{name}.jpg", f"assets/comparison/{name}.webp")
+              s = s.replace(f"assets/comparison/{name}.png", f"assets/comparison/{name}.png")
+              s = s.replace(f"assets/comparison/{name}.jpg", f"assets/comparison/{name}.png")
           p.write_text(s, encoding="utf-8")
 
       - name: Remove broken/staging assets
         shell: bash
         run: |
           rm -rf image-staging
-          rm -f assets/comparison/*.png assets/comparison/*.jpg
+          rm -f assets/comparison/*.jpg assets/comparison/*.webp
 
       - name: Commit rebuilt images
         shell: bash
