@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
 $BasePort = 8765
-$ExpectedVersion = '2.8.1'
+$ExpectedVersion = '2.9.0'
 $PidFile = Join-Path $PSScriptRoot '.pdf_translator.pid'
 $PortFile = Join-Path $PSScriptRoot '.pdf_translator.port'
 $LogFile = Join-Path $PSScriptRoot 'pdf-translator.log'

@@ -1,4 +1,4 @@
-# Scholar PDF Translator v2.8.1
+# Scholar PDF Translator v2.9
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 

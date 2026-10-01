@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Scholar PDF Translator v2.8.1</title>
+  <title>Scholar PDF Translator v2.9.0</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -332,6 +332,18 @@
             <label for="chunkSize">单次翻译的最大字符数</label>
             <input id="chunkSize" type="number" value="3200" min="500" max="12000" />
           </div>
+          <div class="field">
+            <label for="concurrency">同时处理的页数</label>
+            <select id="concurrency">
+              <option value="1">1 页（最稳，最慢）</option>
+              <option value="2">2 页</option>
+              <option value="4" selected>4 页（推荐）</option>
+              <option value="6">6 页</option>
+              <option value="8">8 页（最快，可能触发平台限流）</option>
+            </select>
+          </div>
+        </div>
+        <div class="field-row">
           <div class="field">
             <label for="contextChars">带入的上一页译文字符数</label>
             <input id="contextChars" type="number" value="1200" min="0" max="5000" />

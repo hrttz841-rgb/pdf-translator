@@ -1251,3 +1251,19 @@ textarea {
     padding: 24px 22px;
   }
 }
+
+.restore-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--rule));
+  border-radius: var(--radius);
+  font-size: 13px;
+}
+.restore-bar span {
+  flex: 1;
+  min-width: 260px;
+}

@@ -78,6 +78,7 @@ const state = {
   importMode: null,
 };
 const persistIds = [
+  "concurrency",
   "backend",
   "provider",
   "apiBase",
@@ -211,9 +212,18 @@ function activateImportedProject(name, pages, kind, unit = "chunk") {
   state.manuscript = null;
   state.importMode = kind || "translated";
   state.current = 0;
-  state.pages = pages.map((p, i) =>
-    importedPage(Number(p.n) || i + 1, p.source || "", p.target || ""),
-  );
+  state.pages = pages.map((p, i) => {
+    const pg = importedPage(
+      Number(p.n) || i + 1,
+      p.source || "",
+      p.target || "",
+    );
+    for (const k of ["translated", "proofed", "approved"])
+      if (k in p) pg[k] = !!p[k];
+    if (p.error)
+      Object.assign(pg, { error: p.error, errorStage: p.errorStage || "" });
+    return pg;
+  });
   state.cleaned = false;
   setDocument(
     state.fileName,
@@ -314,6 +324,11 @@ async function importExisting(file) {
         n: p.n || i + 1,
         source: p.source || "",
         target: p.target || "",
+        ...("translated" in p
+          ? { translated: p.translated && !!(p.target || "").trim() }
+          : {}),
+        ...("proofed" in p ? { proofed: p.proofed } : {}),
+        ...("approved" in p ? { approved: p.approved } : {}),
       })),
       obj.pages.some((p) => p.source && p.target) ? "bilingual" : "translated",
       "page",
@@ -837,24 +852,44 @@ async function apiCallResult(task, text, context = "", source = "") {
     custom_prompt: $("customPrompt").value,
     context,
   };
-  const r = await apiFetch("/api/process", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const raw = await r.text();
-  let data = {};
-  try {
-    data = JSON.parse(raw);
-  } catch (e) {}
-  if (!r.ok) throw new Error(data.error || raw || `HTTP ${r.status}`);
-  return { text: data.text || "", truncated: !!data.truncated };
+  // 遇到限流（429）、服务端繁忙（5xx）或网络中断时，等待后自动重试
+  const RETRY =
+    /HTTP (429|5\d\d)|timed? ?out|超时|Connection|连接|reset|Failed to fetch|NetworkError|overloaded|rate limit/i;
+  let lastErr;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt)
+      await new Promise((res) =>
+        setTimeout(res, 2000 * 2 ** (attempt - 1) + Math.random() * 800),
+      );
+    let r, raw;
+    try {
+      r = await apiFetch("/api/process", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      raw = await r.text();
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+    let data = {};
+    try {
+      data = JSON.parse(raw);
+    } catch (e) {}
+    if (r.ok) return { text: data.text || "", truncated: !!data.truncated };
+    lastErr = new Error(data.error || raw || `HTTP ${r.status}`);
+    if (!RETRY.test(lastErr.message)) throw lastErr;
+  }
+  throw lastErr;
 }
 function prevContext(idx) {
   const n = +$("contextChars").value || 0;
   if (!n || idx <= 0) return "";
-  const t = state.pages[idx - 1].target || "";
-  return t.slice(-n);
+  const prev = state.pages[idx - 1];
+  if (prev.target) return prev.target.slice(-n);
+  // 并行翻译时上一页可能还没译完，改用其原文末尾帮助衔接
+  return prev.source ? "（上一页原文）" + prev.source.slice(-n) : "";
 }
 async function translatePage(idx) {
   syncEditors();
@@ -895,7 +930,7 @@ async function proofPage(idx) {
   updateMetrics();
 }
 // ---------- 批量处理：出错不中断、可暂停、可续跑 ----------
-const runner = { stage: "", pause: false, done: 0, total: 0, times: [] };
+const runner = { stage: "", pause: false, done: 0, total: 0, started: 0 };
 function isFatalError(e) {
   const m = String(e?.message || e);
   return /缺少 .*API Key|HTTP 40[13]|登记的地址|会话令牌|API Base 不能为空|模型名称不能为空|无法连接/.test(
@@ -910,54 +945,67 @@ function formatEta(ms) {
   return `预计还需约 ${Math.floor(min / 60)} 小时 ${min % 60} 分钟`;
 }
 function updateEta() {
-  const t = runner.times.slice(-8);
-  if (!t.length || runner.done >= runner.total) {
+  if (!runner.done || runner.done >= runner.total) {
     $("eta").textContent = "";
     return;
   }
-  const avg = t.reduce((x, y) => x + y, 0) / t.length;
-  $("eta").textContent = formatEta(avg * (runner.total - runner.done));
+  const perPage = (performance.now() - runner.started) / runner.done;
+  $("eta").textContent = formatEta(perPage * (runner.total - runner.done));
 }
-// 依次处理 indices 中的页面；单页出错记录在页面上并继续，致命错误（如缺少 Key）立即停止
+function concurrencyFor(stage) {
+  if (stage === "parse") return 1;
+  return Math.max(1, Math.min(8, +$("concurrency").value || 4));
+}
+// 依次或并行处理 indices 中的页面；单页出错记录在页面上并继续，致命错误（如缺少 Key）立即停止
 async function runPages(stage, label, indices, fn) {
   runner.stage = stage;
   runner.done = 0;
   runner.total = indices.length;
-  runner.times = [];
+  runner.started = performance.now();
   updatePipeline();
-  let failed = 0;
-  for (const idx of indices) {
-    if (runner.pause) return { failed, paused: true };
-    const p = state.pages[idx];
-    const t0 = performance.now();
-    try {
-      await fn(idx);
-      if (p.errorStage === stage) {
-        p.error = "";
-        p.errorStage = "";
+  let failed = 0,
+    next = 0,
+    fatal = null;
+  const workers = Math.min(concurrencyFor(stage), indices.length || 1);
+  if (workers > 1) log(`${label}：同时处理 ${workers} 页。`);
+  async function worker() {
+    while (!fatal && !runner.pause && next < indices.length) {
+      const idx = indices[next++];
+      const p = state.pages[idx];
+      try {
+        await fn(idx);
+        if (p.errorStage === stage) {
+          p.error = "";
+          p.errorStage = "";
+        }
+      } catch (e) {
+        if (isFatalError(e)) {
+          fatal = fatal || e;
+          return;
+        }
+        failed++;
+        p.error = `${label}失败：${e.message}`;
+        p.errorStage = stage;
+        log(`第 ${p.n} 页${label}失败：${e.message}`);
       }
-    } catch (e) {
-      if (isFatalError(e)) throw e;
-      failed++;
-      p.error = `${label}失败：${e.message}`;
-      p.errorStage = stage;
-      log(`第 ${p.n} 页${label}失败：${e.message}`);
+      runner.done++;
+      progress(runner.done, runner.total, label);
+      updateEta();
+      renderPageList();
+      updatePipeline();
+      scheduleAutosave();
     }
-    runner.times.push(performance.now() - t0);
-    runner.done++;
-    progress(runner.done, runner.total, label);
-    updateEta();
-    renderPageList();
-    updatePipeline();
   }
-  return { failed, paused: false };
+  await Promise.all(Array.from({ length: workers }, worker));
+  if (fatal) throw fatal;
+  return { failed, paused: runner.pause && runner.done < runner.total };
 }
 function setBusy(on) {
   state.busy = on;
   runner.pause = false;
   $("pauseBtn").hidden = !on;
   $("pauseBtn").disabled = false;
-  $("pauseBtn").textContent = "处理完当前页后暂停";
+  $("pauseBtn").textContent = "处理完进行中的页后暂停";
   if (!on) {
     runner.stage = "";
     $("eta").textContent = "";
@@ -1020,13 +1068,13 @@ function finishRun(results, doneMsg) {
   } else status(doneMsg);
 }
 async function runAll() {
-  if (state.busy || !state.pdf) return;
+  if (state.busy || !canRunAll()) return;
   syncEditors();
   setBusy(true);
   const results = [];
   try {
-    results.push(await stageParse());
-    if (!results.at(-1).paused) results.push(await stageTranslate());
+    if (state.pdf) results.push(await stageParse());
+    if (!results.some((r) => r.paused)) results.push(await stageTranslate());
     if (!results.at(-1).paused && $("proofEnabled").checked)
       results.push(await stageProof());
     finishRun(results, "完整处理完成。建议逐页检查后导出。");
@@ -1642,6 +1690,9 @@ function updatePipeline() {
   $("retryBtn").hidden = !errors || state.busy;
   $("retryBtn").textContent = `重试出错页（${errors}）`;
 }
+function canRunAll() {
+  return !!state.pdf || state.pages.some((p) => p.source && p.source.trim());
+}
 function updateControls() {
   const has = state.pages.length > 0,
     pdf = !!state.pdf,
@@ -1651,7 +1702,7 @@ function updateControls() {
   const canTranslate = pdf || state.pages.some((p) => p.source.trim());
   const cur = state.pages[state.current];
   const dis = (id, v) => ($(id).disabled = v);
-  dis("runBtn", !pdf || busy);
+  dis("runBtn", !canRunAll() || busy);
   dis("auditBtn", !hasTarget || busy);
   dis("reconstructBtn", !hasTarget || busy);
   dis("exportMenuBtn", !hasTarget || busy);
@@ -1676,7 +1727,7 @@ function updateControls() {
     el.disabled = busy || !stageOk[el.dataset.stage];
   });
   $("runBtn").textContent =
-    pdf &&
+    canRunAll() &&
     state.pages.some((p) => p.parsed || p.translated) &&
     state.pages.some(
       (p) => !p.translated || ($("proofEnabled").checked && !p.proofed),
@@ -2111,3 +2162,125 @@ window.addEventListener("beforeunload", (e) => {
   if (state.pages.some((p) => p.translated)) e.preventDefault();
 });
 setTimeout(refreshKeyStatus, 300);
+
+// ---------- 自动保存：长任务进行中把项目存进浏览器，页面意外关闭后可以恢复 ----------
+const AUTOSAVE_DB = "scholar-pdf-translator",
+  AUTOSAVE_KEY = "current";
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(AUTOSAVE_DB, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("projects");
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function idbPut(v) {
+  const db = await idb();
+  await new Promise((res, rej) => {
+    const tx = db.transaction("projects", "readwrite");
+    tx.objectStore("projects").put(v, AUTOSAVE_KEY);
+    tx.oncomplete = res;
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function idbGet() {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const r = db
+      .transaction("projects")
+      .objectStore("projects")
+      .get(AUTOSAVE_KEY);
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+function projectSnapshot() {
+  return {
+    version: 5,
+    savedAt: new Date().toISOString(),
+    fileName: state.fileName,
+    manuscript: state.manuscript,
+    pages: state.pages.map(
+      ({
+        n,
+        source,
+        target,
+        layout,
+        ocr,
+        parsed,
+        translated,
+        proofed,
+        approved,
+        charCount,
+        error,
+        errorStage,
+      }) => ({
+        n,
+        source,
+        target,
+        layout,
+        ocr,
+        parsed,
+        translated,
+        proofed,
+        approved,
+        charCount,
+        error,
+        errorStage,
+      }),
+    ),
+  };
+}
+let autosaveTimer = null;
+function scheduleAutosave() {
+  if (autosaveTimer || !state.pages.some((p) => p.translated)) return;
+  autosaveTimer = setTimeout(async () => {
+    autosaveTimer = null;
+    try {
+      await idbPut(projectSnapshot());
+    } catch (e) {
+      console.warn("自动保存失败", e);
+    }
+  }, 3000);
+}
+async function offerRestore() {
+  let snap;
+  try {
+    snap = await idbGet();
+  } catch (e) {
+    return;
+  }
+  if (!snap?.pages?.some((p) => p.translated) || state.pages.length) return;
+  const done = snap.pages.filter((p) => p.translated).length;
+  const when = new Date(snap.savedAt).toLocaleString();
+  const bar = document.createElement("div");
+  bar.className = "restore-bar";
+  bar.innerHTML = `<span>发现上次未完成的项目：<b></b>，已翻译 ${done}/${snap.pages.length} 页（${when} 自动保存）。</span>`;
+  bar.querySelector("b").textContent = snap.fileName || "未命名";
+  const ok = document.createElement("button");
+  ok.className = "btn small primary";
+  ok.textContent = "恢复并继续";
+  ok.onclick = () => {
+    activateImportedProject(
+      snap.fileName,
+      snap.pages,
+      snap.pages.some((p) => p.source && p.target) ? "bilingual" : "translated",
+      "page",
+    );
+    if (snap.manuscript) state.manuscript = snap.manuscript;
+    updatePipeline();
+    bar.remove();
+    notify("已恢复。点击“继续完整处理”会从未完成的页面接着做。", "ok");
+  };
+  const no = document.createElement("button");
+  no.className = "btn small";
+  no.textContent = "忽略";
+  no.onclick = () => bar.remove();
+  bar.append(ok, no);
+  document.querySelector(".main").prepend(bar);
+}
+window.addEventListener("pagehide", () => {
+  if (state.pages.some((p) => p.translated))
+    idbPut(projectSnapshot()).catch(() => {});
+});
+offerRestore();
