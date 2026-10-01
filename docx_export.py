@@ -2,6 +2,8 @@
 
 import io, re
 
+from notes import pair_notes, condense_publication_info, SUPERSCRIPT
+
 
 def _paras(text):
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -342,8 +344,8 @@ def _note_key(scope, note_id):
     return f"{scope}:{note_id}"
 
 
-def _ensure_footnote_pr(doc):
-    """Place true footnotes at the bottom of the page with stable continuous numbering."""
+def _ensure_footnote_pr(doc, numbering="continuous"):
+    """页下注放在页面底部。numbering：continuous 全书连续；page 每页重排、带圈数字；chapter 每章（节）重排。"""
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
 
@@ -357,11 +359,20 @@ def _ensure_footnote_pr(doc):
         pos.set(qn("w:val"), "pageBottom")
         fp.append(pos)
         fmt = OxmlElement("w:numFmt")
-        fmt.set(qn("w:val"), "decimal")
+        fmt.set(
+            qn("w:val"),
+            "decimalEnclosedCircleChinese" if numbering == "page" else "decimal",
+        )
         fp.append(fmt)
         start = OxmlElement("w:numStart")
         start.set(qn("w:val"), "1")
         fp.append(start)
+        restart = OxmlElement("w:numRestart")
+        restart.set(
+            qn("w:val"),
+            {"page": "eachPage", "chapter": "eachSect"}.get(numbering, "continuous"),
+        )
+        fp.append(restart)
         sect.append(fp)
 
 
@@ -609,6 +620,26 @@ def _patch_true_footnotes(docx_bytes, note_bank):
     return out.getvalue(), {"used": used_keys, "unresolved": sorted(set(unresolved))}
 
 
+def _drop_empty_note_sections(blocks):
+    """注释都转成页下注后，原来的“注释”章只剩标题，删去这样的空章节标题。"""
+    top = {"part", "chapter", "preface_title", "appendix"}
+    out, i = [], 0
+    while i < len(blocks):
+        b = blocks[i]
+        if b["type"] in top:
+            j = i + 1
+            while j < len(blocks) and blocks[j]["type"] not in top:
+                j += 1
+            inner = blocks[i + 1 : j]
+            if inner and all(x["type"] in ("footnote", "notes_heading") for x in inner):
+                out.extend(inner)
+                i = j
+                continue
+        out.append(b)
+        i += 1
+    return out
+
+
 def build_manuscript_docx(data):
     try:
         from docx import Document
@@ -652,12 +683,7 @@ def build_manuscript_docx(data):
             if typ == "footnote":
                 item["note_id"] = str(b.get("note_id") or "").strip()
                 item["note_scope"] = str(b.get("note_scope") or "").strip().lower()
-                # Fallback: recover a leading note number if the model omitted note_id.
-                if not item["note_id"]:
-                    m = re.match(r"^\s*(\d{1,4})[.．、)]\s*(.*)$", text)
-                    if m:
-                        item["note_id"] = m.group(1)
-                        item["text"] = m.group(2).strip()
+                item["origin"] = b.get("origin") or ""
             cleaned.append(item)
     blocks = cleaned
     if not blocks:
@@ -668,22 +694,22 @@ def build_manuscript_docx(data):
     title_blocks = [b for b in blocks if b["type"] == "book_title"]
     subtitle_blocks = [b for b in blocks if b["type"] == "subtitle"]
     author_blocks = [b for b in blocks if b["type"] == "author"]
-    note_bank = {}
-    for b in blocks:
-        if b["type"] != "footnote":
-            continue
-        key = _note_key(b.get("note_scope"), b.get("note_id"))
-        if key:
-            note_bank[key] = b["text"]
+    source_info = condense_publication_info(blocks)
+    blocks, note_bank, note_report = pair_notes(blocks)
     true_footnotes = bool(data.get("true_footnotes", True))
-    marker_keys = []
-    for b in blocks:
-        if b["type"] == "footnote":
-            continue
-        for m in FN_MARKER_RE.finditer(b.get("text", "")):
-            marker_keys.append(_note_key(m.group(1), m.group(2)))
-    marker_key_set = {k for k in marker_keys if k}
-    unmatched_note_keys = [k for k in note_bank if k not in marker_key_set]
+    if true_footnotes:
+        blocks = _drop_empty_note_sections(blocks)
+    if not true_footnotes:
+        # 不转页下注时，把配对好的注号显示为上标数字，注释仍按原位置保留
+        blocks = [
+            dict(
+                b,
+                text=FN_MARKER_RE.sub(
+                    lambda m: m.group(2).translate(SUPERSCRIPT), b["text"]
+                ),
+            )
+            for b in blocks
+        ]
     if title_blocks:
         title = title_blocks[0]["text"]
 
@@ -742,16 +768,16 @@ def build_manuscript_docx(data):
         _set_run_font(r, east_asia="楷体", size_pt=12)
     doc.add_page_break()
 
-    # Copyright/front matter collected from the original front pages.
-    copyrights = [b for b in blocks if b["type"] == "copyright"]
-    if copyrights:
-        for b in copyrights:
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            p.paragraph_format.space_after = Pt(4)
-            p.paragraph_format.line_spacing = 1.35
-            r = p.add_run(b["text"])
-            _set_run_font(r, east_asia="宋体", size_pt=9)
+    # 版权页只保留引用所需的原书信息
+    if source_info:
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(420)
+        r = p.add_run("原书信息")
+        _set_run_font(r, east_asia="黑体", size_pt=9, bold=True)
+        p = doc.add_paragraph()
+        p.paragraph_format.line_spacing = 1.35
+        r = p.add_run(source_info)
+        _set_run_font(r, east_asia="宋体", size_pt=9)
         doc.add_page_break()
 
     # A rebuilt dynamic TOC; original toc_entry blocks are intentionally omitted.
@@ -762,6 +788,8 @@ def build_manuscript_docx(data):
         "subtitle",
         "author",
         "copyright",
+        "source_info",
+        "notes_heading",
         "toc_entry",
         "discard",
         "footnote",
@@ -854,23 +882,35 @@ def build_manuscript_docx(data):
             _set_run_font(r, east_asia="宋体", size_pt=10.5)
         last_type = typ
 
-    # Never silently lose source notes: notes without a detected body anchor are kept in a review appendix.
-    if true_footnotes and unmatched_note_keys:
+    # 注释不会悄悄丢失：没有找到对应注号的注释集中列在书末，供人工核对
+    leftover = (
+        note_report["unmatched_notes"]
+        if true_footnotes
+        else note_report["unmatched_notes"]
+        + [
+            {"page": None, "num": k.split(":", 1)[1], "text": t}
+            for k, t in note_bank.items()
+        ]
+    )
+    if leftover:
         doc.add_page_break()
         p = doc.add_paragraph(style="Heading 1")
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        r = p.add_run("未匹配注释（需人工复核）")
+        r = p.add_run("注释" if not true_footnotes else "未能配对的注释")
         _set_run_font(r, east_asia="黑体", size_pt=16, bold=True)
-        for k in unmatched_note_keys:
+        for n in leftover:
             p = doc.add_paragraph()
             p.paragraph_format.left_indent = Pt(21)
-            p.paragraph_format.hanging_indent = Pt(21)
+            p.paragraph_format.first_line_indent = Pt(-21)
             p.paragraph_format.line_spacing = 1.3
-            r = p.add_run(f"{k}  {note_bank[k]}")
+            where = (
+                f"（原书第 {n['page']} 页）" if n.get("page") and true_footnotes else ""
+            )
+            r = p.add_run(f"{n['num']}. {n['text']}{where}")
             _set_run_font(r, east_asia="宋体", size_pt=8.5)
 
     # Clean output has no inherited source headers/footers; footer contains only page number.
-    _ensure_footnote_pr(doc)
+    _ensure_footnote_pr(doc, data.get("footnote_numbering") or "continuous")
     for sec in doc.sections:
         sec.header.is_linked_to_previous = False
         sec.footer.is_linked_to_previous = False
@@ -886,9 +926,20 @@ def build_manuscript_docx(data):
     doc.save(out)
     content = out.getvalue()
     if true_footnotes and note_bank:
-        content, report = _patch_true_footnotes(content, note_bank)
-        return content
+        content, _ = _patch_true_footnotes(content, note_bank)
     return content
+
+
+def manuscript_report(data):
+    """书稿预览用：注释配对统计与原书信息，与导出 Word 时的结果一致。"""
+    blocks = [
+        b
+        for b in (data.get("manuscript") or {}).get("blocks") or []
+        if (b.get("type") or "") != "discard"
+    ]
+    _, _, report = pair_notes(blocks)
+    report["source_info"] = condense_publication_info(blocks)
+    return report
 
 
 # 没有分页信息时，每个导入单元大约相当于一页书稿；单元过长会让书稿重建超出模型的单次输出长度

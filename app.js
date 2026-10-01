@@ -77,7 +77,10 @@ const state = {
   manuscript: null,
   importMode: null,
 };
+// 供自动化测试读取当前项目状态
+window.SPT = { state };
 const persistIds = [
+  "footnoteNumbering",
   "concurrency",
   "backend",
   "provider",
@@ -154,6 +157,8 @@ function loadSettings() {
 }
 function cleanText(t) {
   return (t || "")
+    .replace(/[ \t]+(\[\^\d{1,3}\])/g, "$1")
+    .replace(/(\[\^\d{1,3}\])(?=[A-Za-z\u00C0-\u024F"“(])/g, "$1 ")
     .replace(/\u00ad/g, "")
     .replace(/([A-Za-z])-\n([a-z])/g, "$1$2")
     .replace(/[ \t]+\n/g, "\n")
@@ -470,25 +475,107 @@ async function showPage(i) {
     $("overlay").innerHTML = "";
   }
 }
+// 章节标题样式的行：不当作重复页眉删除，并单独成段
+const HEADING_LIKE_RE =
+  /^(chapter|part|section|book|appendix|第\s*[一二三四五六七八九十百零〇\d]+\s*[章节部篇卷])\s*([\dIVXLC一二三四五六七八九十]+)?\b/i;
+function median(arr) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((x, y) => x - y);
+  return s[Math.floor(s.length / 2)];
+}
+const SUP_RE = /^(\d{1,3}|[*†‡§])$/;
+// 把 pdf.js 文本项整理成行；字号明显偏小、基线抬高、紧跟在正文文字后的数字识别为注号，记作 [^n]
 function groupLines(items, pageW) {
-  const rows = [];
+  const raw = [];
   for (const it of items) {
-    const x = it.transform?.[4] || 0,
-      y = it.transform?.[5] || 0,
-      h = Math.max(6, Math.abs(it.height || it.transform?.[3] || 10)),
-      w = Math.max(1, it.width || 0),
-      text = (it.str || "").trim();
+    const text = (it.str || "").trim();
     if (!text) continue;
-    let row = rows.find((r) => Math.abs(r.y - y) <= Math.max(2, h * 0.35));
+    raw.push({
+      x: it.transform?.[4] || 0,
+      y: it.transform?.[5] || 0,
+      h: Math.max(4, Math.abs(it.height || it.transform?.[3] || 10)),
+      w: Math.max(1, it.width || 0),
+      text,
+    });
+  }
+  const bodyH =
+    median(raw.filter((r) => r.text.length > 3).map((r) => r.h)) || 10;
+  for (const r of raw) {
+    if (!SUP_RE.test(r.text) || r.h > bodyH * 0.8) continue;
+    // 找左侧紧邻的正常字号文字，基线比它高出约 0.15 到 0.75 个字高
+    const host = raw.find(
+      (o) =>
+        o !== r &&
+        o.h > r.h * 1.2 &&
+        r.y - o.y > o.h * 0.12 &&
+        r.y - o.y < o.h * 0.75 &&
+        r.x >= o.x - 1 &&
+        r.x <= o.x + o.w + o.h * 1.2,
+    );
+    if (host) {
+      r.y = host.y;
+      r.sup = true;
+      r.text = `[^${r.text}]`;
+    }
+  }
+  const rows = [];
+  for (const it of raw) {
+    let row = rows.find(
+      (r) => Math.abs(r.y - it.y) <= Math.max(2, it.h * 0.35),
+    );
     if (!row) {
-      row = { y, h, items: [] };
+      row = { y: it.y, h: it.h, items: [] };
       rows.push(row);
     }
-    row.items.push({ x, y, h, w, text });
+    row.items.push(it);
   }
-  for (const r of rows) r.items.sort((a, b) => a.x - b.x);
+  for (const r of rows) {
+    r.items.sort((a, b) => a.x - b.x);
+    const hs = r.items.filter((i) => !i.sup).map((i) => i.h);
+    r.h = hs.length ? median(hs) : r.items[0].h;
+  }
   rows.sort((a, b) => b.y - a.y);
+  rows.bodyH = bodyH;
   return rows;
+}
+// 页面底部字号偏小、以编号开头的行识别为页下注，返回 { rows: 正文行, notes: [{n, text}] }
+const NOTE_START_RE = /^(?:\[\^(\d{1,3})\]|(\d{1,3})(?:[.)．、]|\s))\s*/;
+function splitFootnoteZone(rows, pageH) {
+  const bodyH = rows.bodyH || 10;
+  const isSmall = (r) => r.h <= bodyH * 0.9;
+  const isPageNo = (r) =>
+    /^\d{1,4}$/.test(
+      r.items
+        .map((i) => i.text)
+        .join("")
+        .trim(),
+    ) && r.y < pageH * 0.1;
+  let k = rows.length;
+  while (
+    k > 0 &&
+    (isSmall(rows[k - 1]) || isPageNo(rows[k - 1])) &&
+    rows[k - 1].y < pageH * 0.45
+  )
+    k--;
+  const zone = rows.slice(k).filter((r) => !isPageNo(r));
+  const text = (r) =>
+    r.items
+      .map((i) => i.text)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  if (!zone.length || !zone.some((r) => NOTE_START_RE.test(text(r))))
+    return { rows, notes: [] };
+  const notes = [];
+  for (const r of zone) {
+    const t = text(r),
+      m = t.match(NOTE_START_RE);
+    if (m) notes.push({ n: m[1] || m[2], text: t.slice(m[0].length) });
+    else if (notes.length) notes[notes.length - 1].text += " " + t;
+    else notes.push({ n: "+", text: t }); // 上一页注释的续行
+  }
+  const keep = new Set(zone);
+  return { rows: rows.filter((r) => !keep.has(r) || isPageNo(r)), notes };
 }
 function detectColumns(rows, pageW) {
   if ($("layoutMode").value === "single") return "single";
@@ -540,7 +627,16 @@ function rowsToBlocks(rows, pageW, pageH, layout) {
       bottomSpan = spanning.filter((r) => r.y <= pageH * 0.72);
     ordered = [...topSpan, ...left, ...right, ...bottomSpan];
   }
-  let current = null;
+  let current = null,
+    prevRight = null,
+    prevH = null;
+  // 本页正文行的右边界：没写到右边界附近就结束的行，视为段落结尾
+  const rights = ordered.map((r) => Math.max(...r.items.map((i) => i.x + i.w)));
+  const colRight =
+    layout === "double"
+      ? null
+      : median(rights.filter((x, k) => makeText(ordered[k]).length > 20)) ||
+        null;
   for (const r of ordered) {
     const text = makeText(r);
     if (!text) continue;
@@ -559,7 +655,21 @@ function rowsToBlocks(rows, pageW, pageH, layout) {
     };
     const gap = current ? Math.abs(current.lastY - r.y) : 999;
     const sameColumn = current && Math.abs(current.x - line.x) < pageW * 0.12;
-    if (current && sameColumn && gap < Math.max(18, h * 1.7)) {
+    const shortPrev =
+      colRight && prevRight !== null && prevRight < colRight - pageW * 0.12;
+    const sizeChange = prevH && Math.abs(h - prevH) > prevH * 0.12;
+    const enumerated =
+      /^(\d{1,3}[.)．]|[•·▪])\s/.test(text) || HEADING_LIKE_RE.test(text);
+    prevRight = maxX;
+    prevH = h;
+    if (
+      current &&
+      sameColumn &&
+      gap < Math.max(18, h * 1.7) &&
+      !shortPrev &&
+      !sizeChange &&
+      !enumerated
+    ) {
       current.text += (current.text.endsWith("-") ? "\n" : " ") + text;
       current.w = Math.max(current.w, line.w);
       current.h += gap || h;
@@ -581,13 +691,23 @@ async function extractStructured(idx) {
   const page = await state.pdf.getPage(idx + 1),
     vp = page.getViewport({ scale: 1 }),
     tc = await page.getTextContent();
-  const rows = groupLines(tc.items, vp.width),
-    layout = detectColumns(rows, vp.width),
+  const all = groupLines(tc.items, vp.width),
+    { rows, notes } = splitFootnoteZone(all, vp.height);
+  rows.bodyH = all.bodyH;
+  const layout = detectColumns(rows, vp.width),
     blocks = rowsToBlocks(rows, vp.width, vp.height, layout);
+  // 页下注以 [^n]: 开头的独立段落放在本页正文之后，续行记作 [^+]:
+  const noteText = notes
+    .map((n) => `[^${n.n}]: ${n.text.replace(/\s+/g, " ").trim()}`)
+    .join("\n\n");
   return {
     layout,
     blocks,
-    text: cleanText(blocks.map((b) => b.text).join("\n\n")),
+    notes,
+    text: cleanText(
+      blocks.map((b) => b.text).join("\n\n") +
+        (noteText ? "\n\n" + noteText : ""),
+    ),
     width: vp.width,
     height: vp.height,
   };
@@ -652,7 +772,14 @@ function headerFooterCandidates() {
     const edge = new Set([...lines.slice(0, 2), ...lines.slice(-2)]);
     for (const s of edge) {
       const n = normalizeHF(s);
-      if (n.length < 3 || n.length > 140) continue;
+      // 章节标题和页下注（如多页都有的“同上”）不算重复页眉
+      if (
+        n.length < 3 ||
+        n.length > 140 ||
+        HEADING_LIKE_RE.test(s.trim()) ||
+        /^\[\^/.test(s.trim())
+      )
+        continue;
       counts.set(n, (counts.get(n) || 0) + 1);
     }
   }
@@ -1205,6 +1332,8 @@ const manuscriptTypes = new Set([
   "bibliography",
   "appendix",
   "toc_entry",
+  "notes_heading",
+  "source_info",
   "discard",
 ]);
 function parseModelJson(text) {
@@ -1232,10 +1361,12 @@ function prefilterBookText(text) {
     /条形码|条码|索书号/,
     /扫描.{0,8}(编号|制作|来源)/,
   ];
+  // 逐行过滤扫描噪声，同时保留空行（段落边界）
   return (text || "")
-    .split(/\n+/)
-    .filter((x) => !junk.some((r) => r.test(x.trim())))
+    .split("\n")
+    .filter((x) => !x.trim() || !junk.some((r) => r.test(x.trim())))
     .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 function normalizeManuscriptBlocks(blocks) {
@@ -1259,16 +1390,20 @@ function normalizeManuscriptBlocks(blocks) {
       prev.type === type &&
       type === "body" &&
       prev.page === page &&
-      !/[。！？!?]$/.test(prev.text) &&
+      !/[。！？!?.…"”」』)）]$/.test(prev.text) &&
       text.length < 900
     ) {
-      prev.text += text;
+      prev.text +=
+        /[A-Za-z0-9,;:]$/.test(prev.text) && /^[A-Za-z0-9(“"]/.test(text)
+          ? " " + text
+          : text;
       continue;
     }
     const item = { type, text, page, level, confidence };
     if (type === "footnote") {
       item.note_id = note_id;
       item.note_scope = note_scope;
+      if (raw.origin) item.origin = raw.origin;
     }
     out.push(item);
   }
@@ -1293,10 +1428,44 @@ function pageRange(group) {
 }
 // 重建一批页面。模型输出被截断或 JSON 不完整时，把这批页面对半拆开重试；
 // 单页仍然失败时先重试一次，再退回为按段落的正文块，保证内容不丢失。
+// 页下注（以 [^n]: 开头的段落）由程序直接提取，不交给模型，避免被改写或遗漏
+const PAGE_NOTE_RE = /^\s*\[\^(\d{1,4}|\+|[*†‡§])\]\s*[:：]\s*(.*)$/;
+function splitPageNotes(text) {
+  const body = [],
+    notes = [];
+  for (const para of (text || "").split(/\n\s*\n/)) {
+    const lines = para.split("\n");
+    let cur = null;
+    const keep = [];
+    for (const line of lines) {
+      const m = line.match(PAGE_NOTE_RE);
+      if (m) {
+        cur = { id: m[1], text: m[2].trim() };
+        notes.push(cur);
+      } else if (cur && line.trim()) cur.text += " " + line.trim();
+      else keep.push(line);
+    }
+    if (keep.join("").trim()) body.push(keep.join("\n"));
+  }
+  return { body: body.join("\n\n"), notes };
+}
 async function reconstructGroup(group, context, job, retried = false) {
   const unitLabel = state.pdf ? "PDF PAGE" : "IMPORTED TEXT UNIT";
+  const pageNotes = [];
   const text = group
-    .map((p) => `=== ${unitLabel} ${p.n} ===\n${prefilterBookText(p.target)}`)
+    .map((p) => {
+      const { body, notes } = splitPageNotes(p.target);
+      for (const n of notes)
+        pageNotes.push({
+          type: "footnote",
+          text: n.text,
+          page: p.n,
+          level: 0,
+          note_id: n.id,
+          origin: "page",
+        });
+      return `=== ${unitLabel} ${p.n} ===\n${prefilterBookText(body)}`;
+    })
     .join("\n\n");
   const sourceText = group.some(
     (p) => p.source && p.source.trim() && p.source.trim() !== p.target.trim(),
@@ -1320,7 +1489,7 @@ async function reconstructGroup(group, context, job, retried = false) {
   if (obj && Array.isArray(obj.blocks)) {
     job.done += group.length;
     progress(job.done, job.total, "AI 书稿重建");
-    return normalizeManuscriptBlocks(obj.blocks);
+    return withPageNotes(normalizeManuscriptBlocks(obj.blocks), pageNotes);
   }
   const why = res.truncated ? "超出模型单次输出长度" : "返回的结构数据不完整";
   if (group.length > 1) {
@@ -1344,13 +1513,33 @@ async function reconstructGroup(group, context, job, retried = false) {
   job.done += 1;
   progress(job.done, job.total, "AI 书稿重建");
   log(`${pageRange(group)}${why}，改为按段落保留为正文。`);
-  return splitParas(prefilterBookText(p.target)).map((t) => ({
-    type: "body",
-    text: t,
-    page: p.n,
-    level: 0,
-    confidence: 0.3,
-  }));
+  return withPageNotes(
+    splitParas(prefilterBookText(splitPageNotes(p.target).body)).map((t) => ({
+      type: "body",
+      text: t,
+      page: p.n,
+      level: 0,
+      confidence: 0.3,
+    })),
+    pageNotes,
+  );
+}
+function withPageNotes(blocks, pageNotes) {
+  if (!pageNotes.length) return blocks;
+  const out = [];
+  const byPage = new Map();
+  for (const n of pageNotes)
+    byPage.set(n.page, [...(byPage.get(n.page) || []), n]);
+  const lastIndex = new Map();
+  blocks.forEach((b, i) => b.page != null && lastIndex.set(b.page, i));
+  blocks.forEach((b, i) => {
+    out.push(b);
+    for (const [pg, idx] of lastIndex)
+      if (idx === i && byPage.has(pg))
+        (out.push(...byPage.get(pg)), byPage.delete(pg));
+  });
+  for (const rest of byPage.values()) out.push(...rest);
+  return out;
 }
 async function reconstructBook(force = false) {
   syncEditors();
@@ -1474,6 +1663,7 @@ async function downloadDocx(mode) {
       })),
       manuscript: mode === "bilingual" ? null : state.manuscript,
       true_footnotes: $("trueFootnotes").checked,
+      footnote_numbering: $("footnoteNumbering").value,
     };
     const r = await apiFetch("/api/export-docx", {
       method: "POST",
@@ -1807,30 +1997,26 @@ const HEADING_TYPES = {
   section: 2,
   subsection: 3,
 };
-function openPreview() {
+async function openPreview() {
   const blocks = state.manuscript?.blocks || [];
-  const anchors = new Set(),
-    notes = new Map();
-  for (const b of blocks) {
-    if (b.type === "footnote")
-      notes.set(noteKey(b.note_scope, b.note_id), b.text);
-    else
-      for (const m of b.text.matchAll(/\[\[FN:([^:\]\n]+):([^\]\n]+)\]\]/g))
-        anchors.add(noteKey(m[1], m[2]));
-  }
-  notes.delete("");
-  const matched = [...anchors].filter((k) => notes.has(k));
-  const noNote = [...anchors].filter((k) => !notes.has(k));
-  const noAnchor = [...notes.keys()].filter((k) => !anchors.has(k));
+  let rep = null;
+  try {
+    const r = await apiFetch("/api/manuscript-report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manuscript: state.manuscript }),
+    });
+    if (r.ok) rep = await r.json();
+  } catch (e) {}
   const headings = blocks.filter((b) => b.type in HEADING_TYPES);
   const body = blocks.filter((b) => b.type === "body").length;
   $("previewStats").innerHTML = [
     ["结构块", blocks.length],
     ["标题", headings.length],
     ["正文段落", body],
-    ["注号", anchors.size],
-    ["注释", notes.size],
-    ["已配对", matched.length],
+    ["注号", rep ? rep.markers : "?"],
+    ["注释", rep ? rep.notes : "?"],
+    ["已配对", rep ? rep.paired : "?"],
   ]
     .map(([k, v]) => `<div class="stat"><b>${v}</b><span>${k}</span></div>`)
     .join("");
@@ -1838,29 +2024,46 @@ function openPreview() {
     ? headings
         .map(
           (h) =>
-            `<li class="lv${HEADING_TYPES[h.type]}"><span>${esc(h.text.replace(/\[\[FN:[^\]]+\]\]/g, ""))}</span>${h.page ? `<em>p.${h.page}</em>` : ""}</li>`,
+            `<li class="lv${HEADING_TYPES[h.type]}"><span>${esc(h.text.replace(/\[\[FN:[^\]]+\]\]|\[\^[^\]]+\]/g, ""))}</span>${h.page ? `<em>p.${h.page}</em>` : ""}</li>`,
         )
         .join("")
     : '<li class="empty">没有识别到章节标题，导出的 Word 将没有目录层级。</li>';
-  const list = (arr, label) =>
+  const where = (x) => (x.page ? `原书第 ${x.page} 页，` : "") + `注 ${x.num}`;
+  const list = (arr, label, fmt) =>
     arr.length
       ? `<p class="warn-text">${label}（${arr.length}）</p><ul class="key-list">${arr
           .slice(0, 30)
-          .map((k) => `<li>${esc(k)}</li>`)
+          .map((x) => `<li>${esc(fmt(x))}</li>`)
           .join(
             "",
           )}${arr.length > 30 ? `<li>…另有 ${arr.length - 30} 条</li>` : ""}</ul>`
       : "";
   const fb = state.manuscript?.fallbackPages || [];
-  $("previewNotes").innerHTML =
-    (fb.length
-      ? `<p class="warn-text">第 ${fb.join("、")} 页未能识别结构，已按正文段落保留，这些页中的标题和注释不会单独排版。</p>`
-      : "") +
-    (anchors.size || notes.size
-      ? `<p>${matched.length} 个注号找到了对应注释${$("trueFootnotes").checked ? "，导出时转为 Word 页下注" : ""}。</p>`
-      : "<p>没有识别到注释。</p>") +
-    list(noNote, "有注号但缺少注释") +
-    list(noAnchor, "有注释但正文中找不到注号");
+  let html = fb.length
+    ? `<p class="warn-text">第 ${fb.join("、")} 页未能识别结构，已按正文段落保留，这些页中的标题和章末注不会单独排版。</p>`
+    : "";
+  if (!rep) html += "<p>无法连接本地服务，暂时不能统计注释配对情况。</p>";
+  else {
+    const m = rep.by_method || {};
+    html +=
+      rep.markers || rep.notes
+        ? `<p>${rep.paired} 个注号找到了对应注释${$("trueFootnotes").checked ? "，导出时转为 Word 页下注" : ""}。其中页下注 ${m.page || 0} 条，章末注或书末注 ${(m.sequence || 0) + (m.scope || 0)} 条。</p>`
+        : "<p>没有识别到注释。</p>";
+    html += list(
+      rep.unmatched_markers,
+      "有注号但没有找到注释（导出时显示为上标数字）",
+      where,
+    );
+    html += list(
+      rep.unmatched_notes,
+      "有注释但正文中找不到注号（导出时列在书末）",
+      (x) => `${where(x)}：${x.text.slice(0, 40)}`,
+    );
+    html += rep.source_info
+      ? `<p class="source-line">原书信息：${esc(rep.source_info)}</p>`
+      : '<p class="warn-text">没有识别到原书出版信息，版权页内容不会出现在导出的书稿中。</p>';
+  }
+  $("previewNotes").innerHTML = html;
   openModal("previewModal");
 }
 function closeExportMenu() {

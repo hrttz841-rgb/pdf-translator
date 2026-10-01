@@ -29,6 +29,7 @@ from ai_client import call_ai, call_ai_result, system_prompt  # noqa: F401
 from docx_export import (  # noqa: F401
     build_translation_docx,
     build_manuscript_docx,
+    manuscript_report,
     import_docx_bytes,
     reflow_blocks,
     _note_key,
@@ -235,6 +236,9 @@ class Handler(BaseHTTPRequestHandler):
                     content,
                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
+                return
+            if self.path == "/api/manuscript-report":
+                self.json_response(manuscript_report(data))
                 return
             if self.path == "/api/import-docx":
                 raw = data.get("base64", "")

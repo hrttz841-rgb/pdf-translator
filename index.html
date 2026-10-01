@@ -367,7 +367,15 @@
         </div>
         <div class="checks">
           <label><input id="proofEnabled" type="checkbox" checked />完整处理时，翻译后自动校对</label>
-          <label><input id="trueFootnotes" type="checkbox" checked />章末注和书末注转为 Word 页下注（连续编号）</label>
+          <label><input id="trueFootnotes" type="checkbox" checked />注释转为 Word 页下注（包括原书的章末注和书末注）</label>
+        </div>
+        <div class="field">
+          <label for="footnoteNumbering">页下注编号</label>
+          <select id="footnoteNumbering">
+            <option value="page">每页重新编号，带圈数字（①②③，中文图书常用）</option>
+            <option value="continuous">全书连续编号（1、2、3）</option>
+            <option value="chapter">每章重新编号（1、2、3）</option>
+          </select>
         </div>
       </div>
 
