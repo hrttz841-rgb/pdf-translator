@@ -140,7 +140,7 @@ STYLE_RULES = {
 MANUSCRIPT_TYPES = (
     "book_title, subtitle, author, copyright, dedication, epigraph, preface_title, "
     "part, chapter, section, subsection, body, blockquote, footnote, figure_caption, "
-    "table_caption, bibliography, appendix, toc_entry, notes_heading, source_info, discard"
+    "table_caption, figure, table, bibliography, appendix, toc_entry, notes_heading, source_info, discard"
 )
 
 
@@ -176,6 +176,9 @@ def system_prompt(data):
             "- 形如 [^12] 的记号是注号，必须原样保留在译文中对应词句之后，不得删除、改写或重新编号；没有这种记号的地方不要自行添加。\n"
             "- 以 [^12]: 或 [^+]: 开头的段落是页下注，保留开头的记号，只翻译其后的注释内容；注释中的文献信息（作者、书名、刊名、出版信息、页码）保留原文不译。\n"
             "- 参考文献条目保留原文不译。\n"
+            "- 单独一行、形如 [[FIG:3-1]] 的记号代表一幅图，原样保留为独立一段。\n"
+            "- 以 [[TABLE:3-1]] 开头、以 [[/TABLE]] 结尾的部分是表格，每行形如“| 单元格 | 单元格 |”。首尾两个记号原样保留；逐个单元格翻译，行数、列数和 | 分隔符保持不变，"
+            "数字、符号和空单元格原样保留，不要合并或拆分单元格，不要改成其他表格格式。\n"
             "- 明显的 OCR 断行、连字符断词可直接修复，但不得删减内容。\n"
             "- 提供的前文上下文只用于保持术语与衔接，不要重复翻译。"
             f"{glossary}{extra}"
@@ -186,6 +189,7 @@ def system_prompt(data):
             f"风格要求：{style}\n"
             "重点检查：漏译、误译、OCR 错误导致的误读、人名机构名与专有名词、数字年份与比例、段落遗漏、术语前后不一致。\n"
             "检查译文是否原样保留了原文中所有形如 [^12] 的注号以及以 [^12]: 开头的页下注记号，缺失的要补回到对应位置。\n"
+            "图片记号 [[FIG:3-1]] 原样保留；[[TABLE:3-1]] 至 [[/TABLE]] 之间的表格保持“| 单元格 |”格式，行数和列数与原文一致，只校对单元格译文。\n"
             "只输出修订后的译文全文，不要列出修改说明，不要使用 Markdown 代码块；没有问题时原样输出译文。"
             f"{glossary}{extra}"
         )
@@ -208,6 +212,8 @@ def system_prompt(data):
             "- level：part=1，chapter=1，section=2，subsection=3，其余为 0。\n"
             "- 页眉、页脚、页码、馆藏章、扫描平台水印、条码、孤立乱码标为 discard 或直接省略。\n"
             "- 原书目录页的条目标为 toc_entry（导出时会根据章节结构重新生成目录）。\n"
+            "- 单独一行、形如 [[FIG:3-1]] 或 [[TABLE:3-1]] 的记号是图片或表格的占位，各输出为一个块，type 分别为 figure 或 table，text 原样为该记号，保持在阅读顺序中的原位置。"
+            "图题、表题（如“图 1.2 ……”“表 3 ……”“Figure 2.1 ……”）分别标为 figure_caption、table_caption；图片下方的资料来源说明也标为 figure_caption 或 table_caption。\n"
             "- 注号：正文中形如 [^12] 的记号必须原样保留在 text 中原来的位置，不要删除、改写或转换格式。"
             "原文明显是注号、但译文里没有记号的上标数字（如紧跟在句末标点后的孤立数字），改写为 [^编号]。\n"
             "- 章末注、书末注：集中排列的编号注释条目，每条输出一个 type=footnote 的块，note_id 填编号（只填数字），text 只放注释内容，不含编号。"

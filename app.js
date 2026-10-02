@@ -76,6 +76,8 @@ const state = {
   scale: 1.35,
   manuscript: null,
   importMode: null,
+  // 图片与表格截图：{ "FIG:3-1": { kind, page, image, w, h, rows } }
+  assets: {},
 };
 // 供自动化测试读取当前项目状态
 window.SPT = { state };
@@ -215,6 +217,7 @@ function activateImportedProject(name, pages, kind, unit = "chunk") {
   state.pdf = null;
   state.fileName = name || "已有译文";
   state.manuscript = null;
+  state.assets = {};
   state.importMode = kind || "translated";
   state.current = 0;
   state.pages = pages.map((p, i) => {
@@ -339,6 +342,7 @@ async function importExisting(file) {
       "page",
     );
     if (obj.manuscript) state.manuscript = obj.manuscript;
+    state.assets = obj.assets || {};
     return;
   }
   if (ext === "docx") {
@@ -364,6 +368,7 @@ async function loadPdf(file) {
   state.fileName = file.name;
   state.manuscript = null;
   state.importMode = null;
+  state.assets = {};
   const buf = await file.arrayBuffer();
   state.pdf = await pdfjsLib.getDocument({
     data: buf,
@@ -577,6 +582,406 @@ function splitFootnoteZone(rows, pageH) {
   const keep = new Set(zone);
   return { rows: rows.filter((r) => !keep.has(r) || isPageNo(r)), notes };
 }
+// ---------- 图片与表格：识别位置、截图保存、表格还原为行列 ----------
+// 图片在文字流中记作独立一段 [[FIG:页-序号]]；表格记作
+// [[TABLE:页-序号]] 加若干行“| 单元格 | 单元格 |”，以 [[/TABLE]] 结束，翻译时逐格翻译
+const CAPTION_RE =
+  /^(fig(ure)?\.?|table|tab\.|chart|map|plate|exhibit|图|表)\s*[\dIVXivx一二三四五六七八九十]/i;
+const ASSET_RE = /\[\[(FIG|TABLE):([\w.-]+)\]\]/g;
+const TABLE_BLOCK_RE =
+  /\[\[TABLE:([\w.-]+)\]\]\s*\n([\s\S]*?)(?:\n\s*\[\[\/TABLE\]\]|$)/g;
+function mulM(m, n) {
+  return [
+    m[0] * n[0] + m[2] * n[1],
+    m[1] * n[0] + m[3] * n[1],
+    m[0] * n[2] + m[2] * n[3],
+    m[1] * n[2] + m[3] * n[3],
+    m[0] * n[4] + m[2] * n[5] + m[4],
+    m[1] * n[4] + m[3] * n[5] + m[5],
+  ];
+}
+function boxOf(m, x0, y0, x1, y1) {
+  const pts = [
+    [x0, y0],
+    [x1, y0],
+    [x0, y1],
+    [x1, y1],
+  ].map(([x, y]) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]);
+  const xs = pts.map((p) => p[0]),
+    ys = pts.map((p) => p[1]);
+  return {
+    x0: Math.min(...xs),
+    y0: Math.min(...ys),
+    x1: Math.max(...xs),
+    y1: Math.max(...ys),
+  };
+}
+const boxW = (b) => b.x1 - b.x0,
+  boxH = (b) => b.y1 - b.y0;
+function boxNear(a, b, d = 0) {
+  return (
+    a.x0 - d <= b.x1 && b.x0 - d <= a.x1 && a.y0 - d <= b.y1 && b.y0 - d <= a.y1
+  );
+}
+function boxUnion(a, b) {
+  return {
+    ...a,
+    x0: Math.min(a.x0, b.x0),
+    y0: Math.min(a.y0, b.y0),
+    x1: Math.max(a.x1, b.x1),
+    y1: Math.max(a.y1, b.y1),
+  };
+}
+function boxPad(b, d) {
+  return { x0: b.x0 - d, y0: b.y0 - d, x1: b.x1 + d, y1: b.y1 + d };
+}
+// 读取页面的绘图指令，得到图片和矢量路径在页面坐标中的范围
+async function pageGraphics(page) {
+  const O = pdfjsLib.OPS,
+    ol = await page.getOperatorList();
+  let ctm = [1, 0, 0, 1, 0, 0];
+  const stack = [],
+    images = [],
+    paths = [];
+  const fns = ol.fnArray,
+    args = ol.argsArray;
+  for (let i = 0; i < fns.length; i++) {
+    const fn = fns[i],
+      a = args[i];
+    if (fn === O.save) stack.push(ctm);
+    else if (fn === O.restore) ctm = stack.pop() || ctm;
+    else if (fn === O.transform) ctm = mulM(ctm, a);
+    else if (fn === O.paintFormXObjectBegin) {
+      stack.push(ctm);
+      if (Array.isArray(a?.[0]) || ArrayBuffer.isView(a?.[0]))
+        ctm = mulM(ctm, Array.from(a[0]));
+    } else if (fn === O.paintFormXObjectEnd) ctm = stack.pop() || ctm;
+    else if (
+      fn === O.paintImageXObject ||
+      fn === O.paintInlineImageXObject ||
+      fn === O.paintImageMaskXObject
+    )
+      images.push(boxOf(ctm, 0, 0, 1, 1));
+    else if (fn === O.constructPath) {
+      const next = fns[i + 1];
+      if (next === O.clip || next === O.eoClip || next === O.endPath) continue;
+      const mm = a?.[2];
+      if (!mm || mm.length < 4 || ![...mm].slice(0, 4).every(Number.isFinite))
+        continue;
+      paths.push(boxOf(ctm, mm[0], mm[1], mm[2], mm[3]));
+    }
+  }
+  return { images, paths };
+}
+function rowText(r) {
+  return r.items
+    .map(
+      (it, j) =>
+        it.text +
+        (j < r.items.length - 1 &&
+        r.items[j + 1].x - (it.x + it.w) > Math.max(3, it.h * 0.25)
+          ? " "
+          : ""),
+    )
+    .join("")
+    .trim();
+}
+function rowBox(r) {
+  const x0 = Math.min(...r.items.map((i) => i.x)),
+    x1 = Math.max(...r.items.map((i) => i.x + i.w));
+  return { x0, x1, y0: r.y - r.h * 0.25, y1: r.y + r.h * 0.85 };
+}
+// 一行中相距较远的文字分成几段，表格的各列就是这样的段
+function rowSegments(r) {
+  const segs = [],
+    gapMin = Math.max(r.h * 1.2, 7);
+  let cur = null;
+  for (const it of r.items) {
+    if (cur && it.x - cur.x1 <= gapMin) {
+      cur.items.push(it);
+      cur.x1 = Math.max(cur.x1, it.x + it.w);
+    } else {
+      cur = { x0: it.x, x1: it.x + it.w, items: [it] };
+      segs.push(cur);
+    }
+  }
+  for (const s of segs) s.text = rowText(s);
+  return segs;
+}
+function buildTable(region, pageW, layout) {
+  const multi = region.filter((x) => x.segs.length >= 2);
+  if (multi.length < 3) return null;
+  const counts = {};
+  for (const x of multi)
+    counts[x.segs.length] = (counts[x.segs.length] || 0) + 1;
+  const mode = +Object.entries(counts).sort(
+    (a, b) => b[1] - a[1] || b[0] - a[0],
+  )[0][0];
+  // 以分段数最常见的行确定各列的横向范围：各行同一列的文字会重叠，列与列之间留有空白
+  const iv = multi
+    .filter((x) => x.segs.length === mode)
+    .flatMap((x) => x.segs.map((s) => [s.x0, s.x1]))
+    .sort((a, b) => a[0] - b[0]);
+  const bands = [];
+  for (const [a, b] of iv) {
+    const last = bands[bands.length - 1];
+    if (last && a <= last[1] + 1) last[1] = Math.max(last[1], b);
+    else bands.push([a, b]);
+  }
+  const cols = bands.length;
+  if (cols < 2) return null;
+  const widths = multi.flatMap((x) => x.segs.map((s) => s.x1 - s.x0));
+  if (cols === 2) {
+    // 两列时排除双栏正文和目录页（标题加页码）
+    if (layout === "double" || median(widths) > pageW * 0.25) return null;
+    const second = multi.map((x) => x.segs[x.segs.length - 1].text);
+    if (second.every((t) => /^[\divxlc]{1,5}$/i.test(t.trim()))) return null;
+  }
+  const grid = region.map((x) => {
+    const cells = Array(cols).fill("");
+    for (const s of x.segs) {
+      let best = 0,
+        bestOv = -Infinity;
+      bands.forEach(([a, b], k) => {
+        const ov = Math.min(b, s.x1) - Math.max(a, s.x0);
+        const score = ov > 0 ? ov : -Math.abs((a + b) / 2 - (s.x0 + s.x1) / 2);
+        if (score > bestOv) ((bestOv = score), (best = k));
+      });
+      cells[best] = cells[best] ? cells[best] + " " + s.text : s.text;
+    }
+    return cells;
+  });
+  if (
+    grid.filter((r) => r.filter(Boolean).length >= 2).length <
+    region.length * 0.6
+  )
+    return null;
+  let bbox = rowBox(region[0].r);
+  for (const x of region) bbox = boxUnion(bbox, rowBox(x.r));
+  return { rows: region.map((x) => x.r), grid, bbox };
+}
+function detectTables(rows, pageW, layout) {
+  const info = rows.map((r) => ({ r, segs: rowSegments(r) }));
+  const isCand = (x) =>
+    x.segs.length >= 2 &&
+    x.segs.every((s) => s.x1 - s.x0 < pageW * 0.45) &&
+    !CAPTION_RE.test(rowText(x.r)) &&
+    !HEADING_LIKE_RE.test(rowText(x.r));
+  const tables = [];
+  let i = 0;
+  while (i < info.length) {
+    if (!isCand(info[i])) {
+      i++;
+      continue;
+    }
+    let last = i,
+      j = i + 1;
+    while (j < info.length) {
+      const gap = info[last].r.y - info[j].r.y;
+      if (gap > Math.max(info[last].r.h, info[j].r.h) * 3) break;
+      if (isCand(info[j])) {
+        last = j++;
+        continue;
+      }
+      // 允许夹着一行较短的单格行，如分组小标题或换行的单元格
+      const s = info[j].segs;
+      if (
+        s.length === 1 &&
+        s[0].x1 - s[0].x0 < pageW * 0.3 &&
+        j + 1 < info.length &&
+        isCand(info[j + 1])
+      ) {
+        j++;
+        continue;
+      }
+      break;
+    }
+    const t = buildTable(info.slice(i, last + 1), pageW, layout);
+    if (t) tables.push(t);
+    i = last + 1;
+  }
+  return tables;
+}
+function detectFigures(g, rows, pageW, pageH, tables) {
+  const pageArea = pageW * pageH;
+  const tboxes = tables.map((t) => boxPad(t.bbox, 14));
+  const inTable = (b) =>
+    tboxes.some(
+      (t) => b.x0 >= t.x0 && b.x1 <= t.x1 && b.y0 >= t.y0 && b.y1 <= t.y1,
+    );
+  const regions = [];
+  for (const b of g.images) {
+    if (boxW(b) < 36 || boxH(b) < 30) continue;
+    if (boxW(b) * boxH(b) > pageArea * 0.7) continue; // 扫描页整页图像
+    if (inTable(b)) continue;
+    regions.push({ ...b, raster: true });
+  }
+  // 矢量图：把相互靠近的路径聚成一组
+  let clusters = g.paths
+    .filter((b) => !(boxW(b) > pageW * 0.9 && boxH(b) > pageH * 0.9))
+    .filter((b) => !inTable(b))
+    .map((b) => ({
+      ...b,
+      n: 1,
+      solid: boxW(b) > 2.5 && boxH(b) > 2.5 ? 1 : 0,
+      hz: boxH(b) <= 2.5 ? 1 : 0,
+      vt: boxW(b) <= 2.5 ? 1 : 0,
+    }));
+  for (let merged = true; merged;) {
+    merged = false;
+    for (let a = 0; a < clusters.length && !merged; a++)
+      for (let b = a + 1; b < clusters.length; b++)
+        if (boxNear(clusters[a], clusters[b], 10)) {
+          const A = clusters[a],
+            B = clusters[b];
+          clusters[a] = {
+            ...boxUnion(A, B),
+            n: A.n + B.n,
+            solid: A.solid + B.solid,
+            hz: A.hz + B.hz,
+            vt: A.vt + B.vt,
+          };
+          clusters.splice(b, 1);
+          merged = true;
+          break;
+        }
+  }
+  for (const c of clusters)
+    if (
+      c.n >= 4 &&
+      boxW(c) >= 60 &&
+      boxH(c) >= 40 &&
+      (c.solid >= 1 || (c.hz >= 1 && c.vt >= 1))
+    )
+      regions.push({ x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1, raster: false });
+  // 相互重叠的区域合并，例如图片和它的边框
+  for (let merged = true; merged;) {
+    merged = false;
+    for (let a = 0; a < regions.length && !merged; a++)
+      for (let b = a + 1; b < regions.length; b++)
+        if (boxNear(regions[a], regions[b], 8)) {
+          regions[a] = {
+            ...boxUnion(regions[a], regions[b]),
+            raster: regions[a].raster || regions[b].raster,
+          };
+          regions.splice(b, 1);
+          merged = true;
+          break;
+        }
+  }
+  const out = [];
+  const taken = new Set();
+  for (const reg of regions) {
+    const boxes = rows.map((r) => ({ r, b: rowBox(r), t: rowText(r) }));
+    const inside = (x, box) => {
+      const cx = (x.b.x0 + x.b.x1) / 2,
+        cy = (x.b.y0 + x.b.y1) / 2;
+      return cx >= box.x0 && cx <= box.x1 && cy >= box.y0 && cy <= box.y1;
+    };
+    let box = { x0: reg.x0, y0: reg.y0, x1: reg.x1, y1: reg.y1 };
+    let absorbed = boxes.filter((x) => !taken.has(x.r) && inside(x, box));
+    if (!reg.raster) {
+      // 坐标轴刻度、图例等短文字在图形外侧不远处，一并归入图中
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const x of boxes) {
+          if (taken.has(x.r) || absorbed.includes(x)) continue;
+          if (x.t.length > 40 || CAPTION_RE.test(x.t)) continue;
+          if (boxW(x.b) > Math.max(boxW(box), 60) * 0.9) continue;
+          if (!boxNear(x.b, box, 16)) continue;
+          absorbed.push(x);
+          box = boxUnion(box, x.b);
+          grew = true;
+        }
+      }
+    }
+    // 框里大多是成段文字的，是文本框，不当作图
+    const longRows = absorbed.filter((x) => x.t.length > 60).length;
+    if (longRows >= 3 || (absorbed.length && longRows > absorbed.length * 0.5))
+      continue;
+    if (!reg.raster && absorbed.length > 30) continue;
+    absorbed.forEach((x) => taken.add(x.r));
+    out.push({ ...box, raster: reg.raster, rows: absorbed.map((x) => x.r) });
+  }
+  return out;
+}
+function tableToText(id, grid) {
+  return (
+    `[[TABLE:${id}]]\n` +
+    grid
+      .map((r) => "| " + r.map((c) => c.replace(/\|/g, "/")).join(" | ") + " |")
+      .join("\n") +
+    "\n[[/TABLE]]"
+  );
+}
+function parseTableLines(body) {
+  return (body || "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith("|"))
+    .map((l) =>
+      l
+        .replace(/^\|/, "")
+        .replace(/\|$/, "")
+        .split("|")
+        .map((c) => c.trim()),
+    );
+}
+// 从译文中取出表格，换成单行占位，返回 { text, tables: {id: 行列} }
+function extractTables(text) {
+  const tables = {};
+  const out = (text || "").replace(TABLE_BLOCK_RE, (all, id, body) => {
+    tables[id] = parseTableLines(body);
+    return `[[TABLE:${id}]]`;
+  });
+  return { text: out, tables };
+}
+// 在页面渲染图上截取图片和表格区域
+async function cropRegions(idx, list) {
+  const page = await state.pdf.getPage(idx + 1);
+  const vp = page.getViewport({ scale: 2 });
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(vp.width);
+  canvas.height = Math.ceil(vp.height);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  const out = {};
+  for (const a of list) {
+    const pad = a.kind === "table" ? 1.5 : 4,
+      b = boxPad(a.bbox, pad);
+    const [x1, y1, x2, y2] = vp.convertToViewportRectangle([
+      b.x0,
+      b.y0,
+      b.x1,
+      b.y1,
+    ]);
+    const sx = Math.max(0, Math.min(x1, x2)),
+      sy = Math.max(0, Math.min(y1, y2)),
+      ex = Math.min(canvas.width, Math.max(x1, x2)),
+      ey = Math.min(canvas.height, Math.max(y1, y2));
+    const w = ex - sx,
+      h = ey - sy;
+    if (w < 4 || h < 4) continue;
+    const k = Math.min(1, 1600 / Math.max(w, h));
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(w * k));
+    c.height = Math.max(1, Math.round(h * k));
+    const cx = c.getContext("2d");
+    cx.fillStyle = "#fff";
+    cx.fillRect(0, 0, c.width, c.height);
+    cx.drawImage(canvas, sx, sy, w, h, 0, 0, c.width, c.height);
+    out[a.id] = {
+      image: c.toDataURL(a.raster ? "image/jpeg" : "image/png", 0.88),
+      w: Math.round(boxW(b) * 10) / 10,
+      h: Math.round(boxH(b) * 10) / 10,
+    };
+    c.width = c.height = 0;
+  }
+  canvas.width = canvas.height = 0;
+  return out;
+}
 function detectColumns(rows, pageW) {
   if ($("layoutMode").value === "single") return "single";
   if ($("layoutMode").value === "double") return "double";
@@ -585,12 +990,15 @@ function detectColumns(rows, pageW) {
   let left = 0,
     right = 0,
     cross = 0;
+  // 左右两栏基线对齐时，两栏的文字会落在同一行里，所以按行内的分段判断
   for (const r of rows) {
-    const min = Math.min(...r.items.map((i) => i.x)),
-      max = Math.max(...r.items.map((i) => i.x + i.w));
-    if (max < mid - gap) left++;
-    else if (min > mid + gap) right++;
-    else cross++;
+    const segs = rowSegments(r);
+    if (segs.some((s) => s.x0 < mid - gap * 0.5 && s.x1 > mid + gap * 0.5)) {
+      cross++;
+      continue;
+    }
+    if (segs.some((s) => s.x1 < mid)) left++;
+    if (segs.some((s) => s.x0 > mid)) right++;
   }
   return left > 4 && right > 4 && cross < Math.max(5, (left + right) * 0.35)
     ? "double"
@@ -598,18 +1006,7 @@ function detectColumns(rows, pageW) {
 }
 function rowsToBlocks(rows, pageW, pageH, layout) {
   const blocks = [];
-  const makeText = (r) =>
-    r.items
-      .map(
-        (it, j) =>
-          it.text +
-          (j < r.items.length - 1 &&
-          r.items[j + 1].x - (it.x + it.w) > Math.max(3, it.h * 0.25)
-            ? " "
-            : ""),
-      )
-      .join("")
-      .trim();
+  const makeText = (r) => (r.special ? "" : rowText(r));
   let ordered = rows;
   if (layout === "double") {
     const mid = pageW / 2;
@@ -617,11 +1014,26 @@ function rowsToBlocks(rows, pageW, pageH, layout) {
       left = [],
       right = [];
     for (const r of rows) {
-      const min = Math.min(...r.items.map((i) => i.x)),
-        max = Math.max(...r.items.map((i) => i.x + i.w));
-      if (min < mid && max > mid) spanning.push(r);
-      else if ((min + max) / 2 < mid) left.push(r);
-      else right.push(r);
+      if (r.special) {
+        const c = (r.box.x0 + r.box.x1) / 2;
+        (r.box.x0 < mid - 20 && r.box.x1 > mid + 20
+          ? spanning
+          : c < mid
+            ? left
+            : right
+        ).push(r);
+        continue;
+      }
+      const segs = rowSegments(r);
+      if (segs.some((s) => s.x0 < mid && s.x1 > mid)) {
+        spanning.push(r);
+        continue;
+      }
+      // 同一行里分属左右两栏的文字拆开
+      const li = r.items.filter((i) => i.x + i.w / 2 < mid),
+        ri = r.items.filter((i) => i.x + i.w / 2 >= mid);
+      if (li.length) left.push({ ...r, items: li });
+      if (ri.length) right.push({ ...r, items: ri });
     }
     const topSpan = spanning.filter((r) => r.y > pageH * 0.72),
       bottomSpan = spanning.filter((r) => r.y <= pageH * 0.72);
@@ -638,6 +1050,24 @@ function rowsToBlocks(rows, pageW, pageH, layout) {
       : median(rights.filter((x, k) => makeText(ordered[k]).length > 20)) ||
         null;
   for (const r of ordered) {
+    if (r.special) {
+      // 图片和表格单独成段，不与前后文字合并
+      const b = r.box;
+      blocks.push({
+        text: r.special,
+        special: true,
+        x: b.x0,
+        y: b.y0,
+        w: b.x1 - b.x0,
+        h: b.y1 - b.y0,
+        top: b.y1,
+        bottom: b.y0,
+      });
+      current = null;
+      prevRight = null;
+      prevH = null;
+      continue;
+    }
     const text = makeText(r);
     if (!text) continue;
     const minX = Math.min(...r.items.map((i) => i.x)),
@@ -684,7 +1114,7 @@ function rowsToBlocks(rows, pageW, pageH, layout) {
   return blocks.map((b, i) => ({
     ...b,
     id: `B${String(i + 1).padStart(2, "0")}`,
-    text: cleanText(b.text),
+    text: b.special ? b.text : cleanText(b.text),
   }));
 }
 async function extractStructured(idx) {
@@ -694,8 +1124,64 @@ async function extractStructured(idx) {
   const all = groupLines(tc.items, vp.width),
     { rows, notes } = splitFootnoteZone(all, vp.height);
   rows.bodyH = all.bodyH;
-  const layout = detectColumns(rows, vp.width),
-    blocks = rowsToBlocks(rows, vp.width, vp.height, layout);
+  const layout = detectColumns(rows, vp.width);
+  // 表格和图片：从文字流中取出所在区域的文字，换成独立的段落
+  let graphics = { images: [], paths: [] };
+  try {
+    graphics = await pageGraphics(page);
+  } catch (e) {}
+  const tables = detectTables(rows, vp.width, layout);
+  // 表格上下的横线（三线表的顶线、底线）也截进表格图中
+  for (const t of tables)
+    for (const pth of graphics.paths)
+      if (
+        pth.x0 < t.bbox.x1 &&
+        pth.x1 > t.bbox.x0 &&
+        pth.y0 >= t.bbox.y0 - 16 &&
+        pth.y1 <= t.bbox.y1 + 16 &&
+        boxW(pth) < vp.width * 0.95
+      )
+        t.bbox = boxUnion(t.bbox, pth);
+  const tableRows = new Set(tables.flatMap((t) => t.rows));
+  const figures = detectFigures(
+    graphics,
+    rows.filter((r) => !tableRows.has(r)),
+    vp.width,
+    vp.height,
+    tables,
+  );
+  const figRows = new Set(figures.flatMap((f) => f.rows));
+  const n = idx + 1,
+    assets = [],
+    special = [];
+  const specialRow = (box, text) => ({
+    y: box.y1,
+    h: 10,
+    box,
+    special: text,
+    items: [{ x: box.x0, w: box.x1 - box.x0, h: 10, text }],
+  });
+  tables.forEach((t, k) => {
+    const id = `${n}-${k + 1}`;
+    assets.push({
+      id: `TABLE:${id}`,
+      kind: "table",
+      bbox: t.bbox,
+      rows: t.grid,
+    });
+    special.push(specialRow(t.bbox, tableToText(id, t.grid)));
+  });
+  figures.forEach((f, k) => {
+    const id = `${n}-${k + 1}`,
+      bbox = { x0: f.x0, y0: f.y0, x1: f.x1, y1: f.y1 };
+    assets.push({ id: `FIG:${id}`, kind: "figure", bbox, raster: f.raster });
+    special.push(specialRow(bbox, `[[FIG:${id}]]`));
+  });
+  const flow = [
+    ...rows.filter((r) => !tableRows.has(r) && !figRows.has(r)),
+    ...special,
+  ].sort((a, b) => b.y - a.y);
+  const blocks = rowsToBlocks(flow, vp.width, vp.height, layout);
   // 页下注以 [^n]: 开头的独立段落放在本页正文之后，续行记作 [^+]:
   const noteText = notes
     .map((n) => `[^${n.n}]: ${n.text.replace(/\s+/g, " ").trim()}`)
@@ -704,6 +1190,7 @@ async function extractStructured(idx) {
     layout,
     blocks,
     notes,
+    assets,
     text: cleanText(
       blocks.map((b) => b.text).join("\n\n") +
         (noteText ? "\n\n" + noteText : ""),
@@ -749,6 +1236,30 @@ async function parsePage(idx) {
     log(
       `第 ${idx + 1} 页读取文本层，识别为${s.layout === "double" ? "双栏" : "单栏"}。`,
     );
+  // 重新解析时先清掉这一页原有的图表
+  for (const k of Object.keys(state.assets))
+    if (state.assets[k].page === idx + 1) delete state.assets[k];
+  if (!useOCR && s.assets?.length) {
+    try {
+      const crops = await cropRegions(idx, s.assets);
+      for (const a of s.assets)
+        if (crops[a.id])
+          state.assets[a.id] = {
+            kind: a.kind,
+            page: idx + 1,
+            bbox: a.bbox,
+            ...crops[a.id],
+            ...(a.rows ? { rows: a.rows } : {}),
+          };
+      const nf = s.assets.filter((a) => a.kind === "figure").length,
+        nt = s.assets.length - nf;
+      log(
+        `第 ${idx + 1} 页识别到${nf ? ` ${nf} 幅图` : ""}${nf && nt ? "、" : ""}${nt ? ` ${nt} 个表格` : ""}。`,
+      );
+    } catch (e) {
+      log(`第 ${idx + 1} 页图表截图失败：${e.message}`);
+    }
+  }
   Object.assign(state.pages[idx], {
     raw: s.text,
     source: s.text,
@@ -777,7 +1288,7 @@ function headerFooterCandidates() {
         n.length < 3 ||
         n.length > 140 ||
         HEADING_LIKE_RE.test(s.trim()) ||
-        /^\[\^/.test(s.trim())
+        /^(\[\^|\||\[\[)/.test(s.trim())
       )
         continue;
       counts.set(n, (counts.get(n) || 0) + 1);
@@ -793,15 +1304,51 @@ function headerFooterCandidates() {
   );
   log(`检测到 ${state.headerFooter.size} 个重复页眉/页脚模式。`);
 }
+// 多页同一位置、同样大小的图片是页眉标志或装饰，不作为插图
+function dropRepeatedFigures() {
+  const sig = (a) =>
+    a.bbox
+      ? [a.bbox.x0, a.bbox.y0, a.bbox.x1, a.bbox.y1]
+          .map((v) => Math.round(v / 4))
+          .join(",")
+      : "";
+  const count = new Map();
+  for (const a of Object.values(state.assets))
+    if (a.kind === "figure" && a.bbox)
+      count.set(sig(a), (count.get(sig(a)) || 0) + 1);
+  const drop = Object.keys(state.assets).filter((id) => {
+    const a = state.assets[id];
+    return a.kind === "figure" && a.bbox && count.get(sig(a)) >= 3;
+  });
+  if (!drop.length) return;
+  const ids = new Set(drop.map((id) => id.slice(4)));
+  for (const id of drop) delete state.assets[id];
+  const strip = (t) =>
+    (t || "")
+      .split("\n")
+      .filter((l) => {
+        const m = l.trim().match(/^\[\[FIG:([\w.-]+)\]\]$/);
+        return !(m && ids.has(m[1]));
+      })
+      .join("\n");
+  for (const p of state.pages) {
+    p.raw = strip(p.raw);
+    p.source = strip(p.source);
+  }
+  log(`${drop.length} 处在多页重复出现的图片判断为页眉标志或装饰，已去掉。`);
+}
 function applyCleanup() {
   markStep(3);
-  if ($("removeHeaders").checked) headerFooterCandidates();
+  if ($("removeHeaders").checked) {
+    headerFooterCandidates();
+    dropRepeatedFigures();
+  }
   for (const p of state.pages) {
     // 按单行拆分并保留空行，这样段落之间的空行（段落边界）不会在清洗中丢失
     let lines = (p.raw || p.source || "").split("\n");
     if ($("removeHeaders").checked)
       lines = lines.filter((s) => {
-        if (!s.trim()) return true;
+        if (!s.trim() || /^\s*(\||\[\[)/.test(s)) return true;
         const n = normalizeHF(s);
         return !state.headerFooter.has(n) && !/^\s*\d{1,4}\s*$/.test(s);
       });
@@ -820,7 +1367,7 @@ function splitChunks(text, maxLen) {
     out = [];
   let cur = "";
   for (const p of paras) {
-    if (p.length > maxLen) {
+    if (p.length > maxLen && !p.startsWith("[[TABLE:")) {
       if (cur) {
         out.push(cur);
         cur = "";
@@ -1329,6 +1876,8 @@ const manuscriptTypes = new Set([
   "footnote",
   "figure_caption",
   "table_caption",
+  "figure",
+  "table",
   "bibliography",
   "appendix",
   "toc_entry",
@@ -1400,6 +1949,13 @@ function normalizeManuscriptBlocks(blocks) {
       continue;
     }
     const item = { type, text, page, level, confidence };
+    if (type === "figure" || type === "table") {
+      const m = text.match(/\[\[(FIG|TABLE):([\w.-]+)\]\]/);
+      item.asset_id = raw.asset_id || (m ? `${m[1]}:${m[2]}` : "");
+      if (!item.asset_id) item.type = "body";
+      if (Array.isArray(raw.rows)) item.rows = raw.rows;
+      if (raw.translated != null) item.translated = !!raw.translated;
+    }
     if (type === "footnote") {
       item.note_id = note_id;
       item.note_scope = note_scope;
@@ -1451,10 +2007,14 @@ function splitPageNotes(text) {
 }
 async function reconstructGroup(group, context, job, retried = false) {
   const unitLabel = state.pdf ? "PDF PAGE" : "IMPORTED TEXT UNIT";
-  const pageNotes = [];
+  const pageNotes = [],
+    tables = {};
   const text = group
     .map((p) => {
-      const { body, notes } = splitPageNotes(p.target);
+      const { body: withTables, notes } = splitPageNotes(p.target);
+      const ex = extractTables(withTables),
+        body = ex.text;
+      Object.assign(tables, ex.tables);
       for (const n of notes)
         pageNotes.push({
           type: "footnote",
@@ -1473,7 +2033,7 @@ async function reconstructGroup(group, context, job, retried = false) {
     ? group
         .map(
           (p) =>
-            `=== ${unitLabel} ${p.n} ORIGINAL ===\n${prefilterBookText(p.source).slice(0, 3200)}`,
+            `=== ${unitLabel} ${p.n} ORIGINAL ===\n${prefilterBookText(extractTables(p.source).text).slice(0, 3200)}`,
         )
         .join("\n\n")
         .slice(0, 18000)
@@ -1489,7 +2049,10 @@ async function reconstructGroup(group, context, job, retried = false) {
   if (obj && Array.isArray(obj.blocks)) {
     job.done += group.length;
     progress(job.done, job.total, "AI 书稿重建");
-    return withPageNotes(normalizeManuscriptBlocks(obj.blocks), pageNotes);
+    return withPageNotes(
+      attachAssets(normalizeManuscriptBlocks(obj.blocks), group, tables),
+      pageNotes,
+    );
   }
   const why = res.truncated ? "超出模型单次输出长度" : "返回的结构数据不完整";
   if (group.length > 1) {
@@ -1514,15 +2077,84 @@ async function reconstructGroup(group, context, job, retried = false) {
   progress(job.done, job.total, "AI 书稿重建");
   log(`${pageRange(group)}${why}，改为按段落保留为正文。`);
   return withPageNotes(
-    splitParas(prefilterBookText(splitPageNotes(p.target).body)).map((t) => ({
-      type: "body",
-      text: t,
-      page: p.n,
-      level: 0,
-      confidence: 0.3,
-    })),
+    attachAssets(
+      splitParas(
+        prefilterBookText(extractTables(splitPageNotes(p.target).body).text),
+      ).map((t) => ({
+        type: "body",
+        text: t,
+        page: p.n,
+        level: 0,
+        confidence: 0.3,
+      })),
+      group,
+      tables,
+    ),
     pageNotes,
   );
+}
+// 图表占位记号变为 figure、table 块；模型漏掉的图表补回到所在页的末尾，保证不丢失
+function assetBlock(id, page, tables) {
+  const a = state.assets[id],
+    [kind, key] = id.split(":");
+  const blk = {
+    type: kind === "FIG" ? "figure" : "table",
+    text: `[[${id}]]`,
+    page: a?.page ?? page,
+    level: 0,
+    confidence: 1,
+    asset_id: id,
+  };
+  if (kind === "TABLE") {
+    const rows = tables[key];
+    blk.translated = !!rows?.length;
+    blk.rows = rows?.length ? rows : a?.rows || [];
+  }
+  return blk;
+}
+function attachAssets(blocks, group, tables) {
+  const pages = new Set(group.map((p) => p.n)),
+    seen = new Set(),
+    out = [];
+  for (const b of blocks) {
+    const parts = (b.text || "").split(/(\[\[(?:FIG|TABLE):[\w.-]+\]\])/);
+    if (parts.length === 1) {
+      out.push(b);
+      continue;
+    }
+    for (const part of parts) {
+      const m = part.match(/^\[\[(FIG|TABLE):([\w.-]+)\]\]$/);
+      if (m) {
+        const id = `${m[1]}:${m[2]}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push(assetBlock(id, b.page, tables));
+      } else if (part.trim()) out.push({ ...b, text: part.trim() });
+    }
+  }
+  const missing = Object.keys(state.assets)
+    .filter((id) => pages.has(state.assets[id].page) && !seen.has(id))
+    .sort();
+  for (const id of missing) {
+    const blk = assetBlock(id, state.assets[id].page, tables);
+    // 优先放在同页还没有配图的图题之前，或还没有配表的表题之后
+    const capType = blk.type === "figure" ? "figure_caption" : "table_caption";
+    let at = out.findIndex(
+      (b, i) =>
+        b.page === blk.page &&
+        b.type === capType &&
+        (blk.type === "figure"
+          ? out[i - 1]?.type !== "figure"
+          : out[i + 1]?.type !== "table"),
+    );
+    if (at >= 0 && blk.type === "table") at += 1;
+    if (at < 0) {
+      out.forEach((b, i) => b.page === blk.page && (at = i));
+      at = at >= 0 ? at + 1 : out.length;
+    }
+    out.splice(at, 0, blk);
+  }
+  return out;
 }
 function withPageNotes(blocks, pageNotes) {
   if (!pageNotes.length) return blocks;
@@ -1615,15 +2247,42 @@ function base() {
     "",
   );
 }
+// 译文中的图片记号换成图片，表格换成 HTML 表格
+function richHTML(text) {
+  text = text || "";
+  const re =
+    /\[\[TABLE:([\w.-]+)\]\]\s*\n([\s\S]*?)(?:\n\s*\[\[\/TABLE\]\]|$)|\[\[FIG:([\w.-]+)\]\]/g;
+  const parts = [];
+  let last = 0;
+  for (const m of text.matchAll(re)) {
+    parts.push(esc(text.slice(last, m.index)).replace(/\n/g, "<br>"));
+    if (m[3]) {
+      const a = state.assets["FIG:" + m[3]];
+      if (a?.image)
+        parts.push(`<figure><img src="${a.image}" alt=""></figure>`);
+    } else
+      parts.push(
+        `<table class="t">${parseTableLines(m[2])
+          .map(
+            (r, i) =>
+              `<tr>${r.map((c) => (i ? `<td>${esc(c)}</td>` : `<th>${esc(c)}</th>`)).join("")}</tr>`,
+          )
+          .join("")}</table>`,
+      );
+    last = m.index + m[0].length;
+  }
+  parts.push(esc(text.slice(last)).replace(/\n/g, "<br>"));
+  return parts.join("");
+}
 function makeHTML(bilingual = false) {
   syncEditors();
   const pages = state.pages
     .map(
       (p, i) =>
-        `<section class="page"><div class="pn">${i + 1}</div>${bilingual ? `<div class="grid"><article><h3>Original</h3><div>${esc(p.source).replace(/\n/g, "<br>")}</div></article><article><h3>Translation</h3><div>${esc(p.target || p.source).replace(/\n/g, "<br>")}</div></article></div>` : `<article>${esc(p.target || p.source).replace(/\n/g, "<br>")}</article>`}</section>`,
+        `<section class="page"><div class="pn">${i + 1}</div>${bilingual ? `<div class="grid"><article><h3>Original</h3><div>${richHTML(p.source)}</div></article><article><h3>Translation</h3><div>${richHTML(p.target || p.source)}</div></article></div>` : `<article>${richHTML(p.target || p.source)}</article>`}</section>`,
     )
     .join("");
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(base())}</title><style>@page{size:A4;margin:18mm 18mm 20mm}body{font-family:"Noto Serif SC","Songti SC","Times New Roman",serif;color:#111;line-height:1.75;margin:0}.page{page-break-after:always;position:relative}.pn{position:absolute;right:0;top:-8mm;font:9pt sans-serif;color:#777}.grid{display:grid;grid-template-columns:1fr 1fr;gap:9mm}.grid article+article{border-left:1px solid #ddd;padding-left:9mm}article{font-size:10.5pt;text-align:justify}h3{font:600 9pt sans-serif;color:#666;border-bottom:1px solid #ddd;padding-bottom:4px}@media(max-width:800px){.grid{grid-template-columns:1fr}.grid article+article{border-left:0;padding-left:0;border-top:1px solid #ddd;padding-top:8px}}</style></head><body>${pages}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(base())}</title><style>@page{size:A4;margin:18mm 18mm 20mm}body{font-family:"Noto Serif SC","Songti SC","Times New Roman",serif;color:#111;line-height:1.75;margin:0}.page{page-break-after:always;position:relative}.pn{position:absolute;right:0;top:-8mm;font:9pt sans-serif;color:#777}.grid{display:grid;grid-template-columns:1fr 1fr;gap:9mm}.grid article+article{border-left:1px solid #ddd;padding-left:9mm}article{font-size:10.5pt;text-align:justify}figure{margin:8px 0;text-align:center}figure img{max-width:100%}table.t{border-collapse:collapse;margin:8px auto;font-size:9.5pt;border-top:1.5px solid #000;border-bottom:1.5px solid #000}table.t th{border-bottom:.75px solid #000;font-weight:normal}table.t td,table.t th{padding:2px 8px;text-align:center}table.t td:first-child,table.t th:first-child{text-align:left}h3{font:600 9pt sans-serif;color:#666;border-bottom:1px solid #ddd;padding-bottom:4px}@media(max-width:800px){.grid{grid-template-columns:1fr}.grid article+article{border-left:0;padding-left:0;border-top:1px solid #ddd;padding-top:8px}}</style></head><body>${pages}</body></html>`;
 }
 async function exportWord(mode = "translated") {
   syncEditors();
@@ -1645,6 +2304,23 @@ async function exportWord(mode = "translated") {
   }
   await downloadDocx("bilingual");
 }
+// 只发送导出内容中用到的图表截图
+function assetPayload(mode) {
+  const ids = new Set();
+  if (mode !== "bilingual" && state.manuscript)
+    for (const b of state.manuscript.blocks)
+      if (b.asset_id) ids.add(b.asset_id);
+  if (mode === "bilingual")
+    for (const p of state.pages)
+      for (const m of `${p.source}\n${p.target}`.matchAll(ASSET_RE))
+        ids.add(`${m[1]}:${m[2]}`);
+  const out = {};
+  for (const id of ids) {
+    const a = state.assets[id];
+    if (a?.image) out[id] = { kind: a.kind, image: a.image, w: a.w, h: a.h };
+  }
+  return out;
+}
 async function downloadDocx(mode) {
   const btn = $("exportMenuBtn");
   btn.disabled = true;
@@ -1662,6 +2338,7 @@ async function downloadDocx(mode) {
         target: p.target,
       })),
       manuscript: mode === "bilingual" ? null : state.manuscript,
+      assets: assetPayload(mode),
       true_footnotes: $("trueFootnotes").checked,
       footnote_numbering: $("footnoteNumbering").value,
     };
@@ -1707,6 +2384,7 @@ function exportProject() {
       ]),
     ),
     manuscript: state.manuscript,
+    assets: state.assets,
     pages: state.pages.map(
       ({
         n,
@@ -2014,6 +2692,8 @@ async function openPreview() {
     ["结构块", blocks.length],
     ["标题", headings.length],
     ["正文段落", body],
+    ["图", blocks.filter((b) => b.type === "figure").length],
+    ["表", blocks.filter((b) => b.type === "table").length],
     ["注号", rep ? rep.markers : "?"],
     ["注释", rep ? rep.notes : "?"],
     ["已配对", rep ? rep.paired : "?"],
@@ -2403,6 +3083,7 @@ function projectSnapshot() {
     savedAt: new Date().toISOString(),
     fileName: state.fileName,
     manuscript: state.manuscript,
+    assets: state.assets,
     pages: state.pages.map(
       ({
         n,
@@ -2471,6 +3152,7 @@ async function offerRestore() {
       "page",
     );
     if (snap.manuscript) state.manuscript = snap.manuscript;
+    state.assets = snap.assets || {};
     updatePipeline();
     bar.remove();
     notify("已恢复。点击“继续完整处理”会从未完成的页面接着做。", "ok");

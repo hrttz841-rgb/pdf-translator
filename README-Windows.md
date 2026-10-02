@@ -1,4 +1,4 @@
-# Scholar PDF Translator v2.10
+# Scholar PDF Translator v2.11
 
 面向学术论文、报告和扫描图书的本地 PDF 翻译与中文书稿重建工具。
 

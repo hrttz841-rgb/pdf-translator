@@ -11,8 +11,13 @@ def _paras(text):
         return []
     # Translation prompts preserve paragraphs with blank lines. If a page contains
     # only line breaks, keep those lines together rather than exploding every line.
+    # 表格段落（[[TABLE:…]] 开头）保留换行，其余段落内的换行合并
     parts = [
-        re.sub(r"\s*\n\s*", " ", x).strip()
+        (
+            x.strip()
+            if x.lstrip().startswith("[[TABLE:")
+            else re.sub(r"\s*\n\s*", " ", x).strip()
+        )
         for x in re.split(r"\n\s*\n+", text)
         if x.strip()
     ]
@@ -53,6 +58,8 @@ def _looks_heading(text):
 def _join_across_page(prev, nxt, target=False):
     if not prev or not nxt or _looks_heading(prev) or _looks_heading(nxt):
         return False
+    if prev.lstrip().startswith("[[") or nxt.lstrip().startswith("[["):
+        return False
     p = prev.rstrip()
     n = nxt.lstrip()
     if target:
@@ -78,7 +85,12 @@ def reflow_blocks(pages, field="target", target=True):
             continue
         start = len(blocks)
         for x in ps:
-            kind = "heading" if _looks_heading(x) else "body"
+            ref = _asset_ref(x)
+            kind = (
+                ("figure" if ref[0] == "FIG" else "table")
+                if ref
+                else "heading" if _looks_heading(x) else "body"
+            )
             blocks.append({"text": x, "kind": kind, "page": page.get("n")})
         # Heal only the boundary created by the original PDF page break.
         if start > 0 and start < len(blocks):
@@ -152,6 +164,193 @@ def _style_doc(doc, bilingual=False):
     return sec
 
 
+# ---------- 图片与表格 ----------
+
+ASSET_LINE_RE = re.compile(r"^\s*\[\[(FIG|TABLE):([\w.-]+)\]\]")
+NOTE_MARK_RE = re.compile(r"\[\^(\d{1,4}|[*†‡§])\]")
+
+
+def _asset_ref(text):
+    """段落是图片或表格时返回 ("FIG"/"TABLE", 编号)，否则返回 None。"""
+    m = ASSET_LINE_RE.match(text or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+def parse_table_text(text):
+    """把“| 单元格 | 单元格 |”形式的表格文字解析为行列。"""
+    rows = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        line = line[1:-1] if line.endswith("|") and len(line) > 1 else line[1:]
+        rows.append([c.strip() for c in line.split("|")])
+    return rows
+
+
+def _decode_image(asset):
+    import base64
+
+    data = (asset or {}).get("image") or ""
+    if "," in data:
+        data = data.split(",", 1)[1]
+    try:
+        return io.BytesIO(base64.b64decode(data))
+    except Exception:
+        return None
+
+
+def _add_picture(container, asset, max_width_pt, style=None):
+    """插入一幅图，宽度不超过版心；图下方的图题与它排在同一页。"""
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    stream = _decode_image(asset)
+    if stream is None:
+        return None
+    p = container.add_paragraph(style=style) if style else container.add_paragraph()
+    if not style:
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.first_line_indent = Pt(0)
+        p.paragraph_format.keep_with_next = True
+    width = min(float(asset.get("w") or max_width_pt), max_width_pt)
+    try:
+        p.add_run().add_picture(stream, width=Pt(width))
+    except Exception:
+        p._p.getparent().remove(p._p)
+        return None
+    return p
+
+
+def _display_len(text):
+    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in text or "")
+
+
+def _cell_border(cell, edge, sz):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    tcPr = cell._tc.get_or_add_tcPr()
+    borders = tcPr.find(qn("w:tcBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tcBorders")
+        # tcBorders 位于 tcW、gridSpan、vMerge 之后
+        anchor = None
+        for tag in ("w:shd", "w:noWrap", "w:tcMar", "w:textDirection", "w:vAlign"):
+            anchor = tcPr.find(qn(tag))
+            if anchor is not None:
+                break
+        if anchor is not None:
+            anchor.addprevious(borders)
+        else:
+            tcPr.append(borders)
+    e = OxmlElement(f"w:{edge}")
+    e.set(qn("w:val"), "single")
+    e.set(qn("w:sz"), str(sz))
+    e.set(qn("w:space"), "0")
+    e.set(qn("w:color"), "000000")
+    borders.append(e)
+
+
+def add_three_line_table(container, rows, width_pt, font_pt=10.5, style=None):
+    """学术论文常用的三线表：顶线、底线较粗，表头下一条细线，没有竖线。"""
+    from docx.shared import Pt
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    rows = [
+        [str(c or "") for c in r] for r in rows if any(str(c or "").strip() for c in r)
+    ]
+    if not rows:
+        return None
+    cols = max(len(r) for r in rows)
+    rows = [r + [""] * (cols - len(r)) for r in rows]
+    table = container.add_table(rows=len(rows), cols=cols)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    tblPr = table._tbl.tblPr
+    borders = OxmlElement("w:tblBorders")
+    for edge, val, sz in (
+        ("top", "single", 12),
+        ("left", "nil", 0),
+        ("bottom", "single", 12),
+        ("right", "nil", 0),
+        ("insideH", "nil", 0),
+        ("insideV", "nil", 0),
+    ):
+        e = OxmlElement(f"w:{edge}")
+        e.set(qn("w:val"), val)
+        if sz:
+            e.set(qn("w:sz"), str(sz))
+            e.set(qn("w:space"), "0")
+            e.set(qn("w:color"), "000000")
+        borders.append(e)
+    anchor = None
+    for tag in ("w:shd", "w:tblLayout", "w:tblCellMar", "w:tblLook"):
+        anchor = tblPr.find(qn(tag))
+        if anchor is not None:
+            break
+    if anchor is not None:
+        anchor.addprevious(borders)
+    else:
+        tblPr.append(borders)
+    # 列宽按各列最长内容分配
+    weights = [
+        min(30, max(4, max(_display_len(r[k]) for r in rows))) for k in range(cols)
+    ]
+    total = sum(weights)
+    widths = [Pt(width_pt * w / total) for w in weights]
+    for k, col in enumerate(table.columns):
+        col.width = widths[k]
+    for i, r in enumerate(rows):
+        for k, text in enumerate(r):
+            cell = table.cell(i, k)
+            cell.width = widths[k]
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            p = cell.paragraphs[0]
+            if style:
+                p.style = style
+            else:
+                p.paragraph_format.line_spacing = 1.2
+                p.paragraph_format.space_after = Pt(0)
+            p.paragraph_format.first_line_indent = Pt(0)
+            p.alignment = (
+                WD_ALIGN_PARAGRAPH.LEFT if k == 0 else WD_ALIGN_PARAGRAPH.CENTER
+            )
+            run = p.add_run(
+                NOTE_MARK_RE.sub(lambda m: m.group(1).translate(SUPERSCRIPT), text)
+            )
+            if not style:
+                _set_run_font(run, east_asia="宋体", size_pt=font_pt)
+            if i == 0 and len(rows) > 1:
+                _cell_border(cell, "bottom", 6)
+    if len(rows) > 1:
+        trPr = table.rows[0]._tr.get_or_add_trPr()
+        th = OxmlElement("w:tblHeader")
+        th.set(qn("w:val"), "true")
+        trPr.append(th)
+    return table
+
+
+def _add_asset(container, ref, text, assets, width_pt, font_pt=10.5, styles=None):
+    """按段落中的记号插入图片或表格；表格优先用译文行列，没有时退回原表截图。"""
+    styles = styles or {}
+    kind, key = ref
+    asset = (assets or {}).get(f"{kind}:{key}")
+    if kind == "TABLE":
+        rows = parse_table_text(text)
+        if rows and add_three_line_table(
+            container, rows, width_pt, font_pt, styles.get("table")
+        ):
+            return True
+    if asset:
+        return (
+            _add_picture(container, asset, width_pt, styles.get("figure")) is not None
+        )
+    return False
+
+
 def build_translation_docx(data, bilingual=False):
     try:
         from docx import Document
@@ -183,6 +382,7 @@ def build_translation_docx(data, bilingual=False):
     tr = tp.add_run(title)
     _set_run_font(tr, east_asia="黑体", size_pt=18, bold=True)
 
+    assets = data.get("assets") or {}
     if not bilingual:
         blocks = reflow_blocks(pages, "target", target=True)
         last_page = None
@@ -194,6 +394,9 @@ def build_translation_docx(data, bilingual=False):
                 _set_run_font(r, east_asia="宋体", size_pt=8)
                 r.font.italic = True
                 last_page = b.get("page")
+            ref = _asset_ref(b["text"])
+            if ref and _add_asset(doc, ref, b["text"], assets, 440):
+                continue
             if b["kind"] == "heading":
                 p = doc.add_paragraph(style="Heading 1")
                 p.paragraph_format.space_before = Pt(10)
@@ -247,6 +450,13 @@ def build_translation_docx(data, bilingual=False):
                 ):
                     cells[j].width = widths[j]
                     cells[j].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+                    ref = _asset_ref(text)
+                    if ref and _add_asset(cells[j], ref, text, assets, 330, 9):
+                        # 单元格自带一个空段落，插入图表后删去
+                        first = cells[j].paragraphs[0]
+                        if not first.text and len(cells[j].paragraphs) > 1:
+                            first._p.getparent().remove(first._p)
+                        continue
                     p = cells[j].paragraphs[0]
                     p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
                     p.paragraph_format.space_after = Pt(3)
@@ -722,6 +932,19 @@ BOOK_TEMPLATE = {
             before=6,
             after=6,
         ),
+        # 图片单独成段居中，与下方图题排在同一页；表格文字比正文小一号
+        dict(
+            name="图片",
+            ea="宋体",
+            size=10.5,
+            align="center",
+            line=1.0,
+            before=6,
+            after=4,
+            keep=True,
+        ),
+        dict(name="表格文字", ea="宋体", size=10.5, line=1.25, after=0),
+        dict(name="表后空行", ea="宋体", size=6, line=1.0, after=6),
         dict(
             name="参考文献",
             ea="宋体",
@@ -1103,18 +1326,37 @@ def build_manuscript_docx(data):
     if not blocks:
         # Safety fallback: convert existing translated pages to body/heading blocks.
         for b in reflow_blocks(data.get("pages") or [], "target", target=True):
-            blocks.append(
-                {
-                    "type": "chapter" if b["kind"] == "heading" else "body",
-                    "text": b["text"],
-                    "page": b.get("page"),
-                    "level": 1 if b["kind"] == "heading" else 0,
-                }
-            )
+            item = {
+                "type": {"heading": "chapter"}.get(b["kind"], b["kind"]),
+                "text": b["text"],
+                "page": b.get("page"),
+                "level": 1 if b["kind"] == "heading" else 0,
+            }
+            ref = _asset_ref(b["text"])
+            if ref:
+                item["asset_id"] = f"{ref[0]}:{ref[1]}"
+                item["rows"] = parse_table_text(b["text"])
+                item["text"] = f"[[{ref[0]}:{ref[1]}]]"
+            blocks.append(item)
 
+    assets = data.get("assets") or {}
     cleaned = []
     for b in blocks:
         typ = (b.get("type") or "body").strip().lower()
+        if typ in ("figure", "table"):
+            aid = str(b.get("asset_id") or "")
+            if aid:
+                cleaned.append(
+                    {
+                        "type": typ,
+                        "text": f"[[{aid}]]",
+                        "page": b.get("page"),
+                        "level": 0,
+                        "asset_id": aid,
+                        "rows": b.get("rows") or [],
+                    }
+                )
+            continue
         text = re.sub(r"\s+", " ", (b.get("text") or "").strip())
         if typ == "discard" or _hard_noise(text):
             continue
@@ -1230,6 +1472,8 @@ def build_manuscript_docx(data):
         "table_caption": "图表标题",
         "bibliography": "参考文献",
     }
+    pg = T["page"]
+    text_width = (pg["width"] - pg["left"] - pg["right"]) / 2.54 * 72
     last_type = None
     for b in blocks:
         typ = b["type"]
@@ -1247,8 +1491,28 @@ def build_manuscript_docx(data):
                 # 部标题比章标题大一号，并在页面中上部
                 p.paragraph_format.space_before = Pt(120)
                 p.runs[0].font.size = Pt(18)
+        elif typ in ("figure", "table"):
+            if typ == "figure" and last_type is None:
+                # 正文开始之前的图片多为书名页、版权页上的出版社标志，不放入书稿
+                continue
+            kind, key = b["asset_id"].split(":", 1)
+            asset = assets.get(b["asset_id"])
+            done = False
+            if typ == "table" and b.get("rows"):
+                done = (
+                    add_three_line_table(doc, b["rows"], text_width, style="表格文字")
+                    is not None
+                )
+                if done:
+                    # 表格后留出与正文的间距
+                    doc.add_paragraph(style="表后空行")
+            if not done and asset:
+                _add_picture(doc, asset, text_width, style="图片")
         else:
-            doc.add_paragraph(text, style=style_of.get(typ, "书稿正文"))
+            p = doc.add_paragraph(text, style=style_of.get(typ, "书稿正文"))
+            if typ == "table_caption":
+                # 表题在表格上方，与表格排在同一页
+                p.paragraph_format.keep_with_next = True
         last_type = typ
 
     # 注释不会悄悄丢失：没有找到对应注号的注释集中列在书末，供人工核对
@@ -1325,7 +1589,12 @@ def _chunk_text_as_pages(text, max_chars=IMPORT_UNIT_CHARS):
     paras = [x.strip() for x in re.split(r"\n\s*\n", text) if x.strip()]
     pages, cur, n = [], [], 0
     for para in paras:
-        for piece in _split_long_paragraph(para, max_chars):
+        pieces = (
+            [para]
+            if para.startswith("[[TABLE:")
+            else _split_long_paragraph(para, max_chars)
+        )
+        for piece in pieces:
             if cur and n + len(piece) > max_chars:
                 pages.append("\n\n".join(cur))
                 cur, n = [], 0
@@ -1443,7 +1712,40 @@ def import_docx_bytes(blob):
         if t and not re.fullmatch(r"原\s*PDF\s*第\s*\d+\s*页", t, re.I):
             cur.append(t)
 
-    for p in doc.paragraphs:
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    table_no = 0
+    for el in doc.element.body.iterchildren():
+        tag = el.tag.split("}")[-1]
+        if tag == "tbl":
+            # Word 中的表格转为“| 单元格 |”格式，翻译和书稿重建时按表格处理
+            rows = []
+            for row in Table(el, doc).rows:
+                cells, seen = [], set()
+                for c in row.cells:
+                    if id(c._tc) in seen:
+                        continue
+                    seen.add(id(c._tc))
+                    cells.append(
+                        " ".join(x.text.strip() for x in c.paragraphs if x.text.strip())
+                    )
+                if any(cells):
+                    rows.append(cells)
+            if rows:
+                table_no += 1
+                add(
+                    f"[[TABLE:W{table_no}]]\n"
+                    + "\n".join(
+                        "| " + " | ".join(c.replace("|", "/") for c in r) + " |"
+                        for r in rows
+                    )
+                    + "\n[[/TABLE]]"
+                )
+            continue
+        if tag != "p":
+            continue
+        p = Paragraph(el, doc)
         before, segments = _paragraph_segments(p)
         if before and cur:
             page_texts.append(cur)

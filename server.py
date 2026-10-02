@@ -8,12 +8,12 @@ ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PDF_TRANSLATOR_PORT", "8765"))
 APP_ID = "scholar-pdf-translator"
-APP_VERSION = "2.10.0"
+APP_VERSION = "2.11.0"
 # 每次启动随机生成的会话令牌。只注入到本服务提供的页面中，其他网站无法读取，
 # 因而无法冒用本地服务调用 AI 接口或管理已保存的 API Key。
 SESSION_TOKEN = secrets.token_urlsafe(32)
 TOKEN_HEADER = "X-SPT-Token"
-MAX_BODY_BYTES = 90 * 1024 * 1024
+MAX_BODY_BYTES = 400 * 1024 * 1024  # 书稿导出会带上图表截图
 
 # PROVIDERS、provider_info、system_prompt、reflow_blocks、_note_key 等在此重新导出，供测试与脚本使用
 from providers import PROVIDERS, normalize_provider, provider_info  # noqa: F401
