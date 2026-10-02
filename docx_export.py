@@ -301,38 +301,6 @@ def _set_update_fields(doc):
     node.set(qn("w:val"), "true")
 
 
-def _add_toc_field(doc):
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    p = doc.add_paragraph()
-    p.alignment = 1
-    r = p.add_run("目录")
-    _set_run_font(r, east_asia="黑体", size_pt=16, bold=True)
-    p.paragraph_format.space_after = __import__("docx").shared.Pt(10)
-    toc = doc.add_paragraph()
-    begin = OxmlElement("w:fldChar")
-    begin.set(qn("w:fldCharType"), "begin")
-    instr = OxmlElement("w:instrText")
-    instr.set(qn("xml:space"), "preserve")
-    instr.text = ' TOC \\o "1-3" \\h \\z \\u '
-    sep = OxmlElement("w:fldChar")
-    sep.set(qn("w:fldCharType"), "separate")
-    placeholder = OxmlElement("w:t")
-    placeholder.text = (
-        "打开 Word 后目录将自动更新；如未更新，请右键目录并选择“更新域”。"
-    )
-    end = OxmlElement("w:fldChar")
-    end.set(qn("w:fldCharType"), "end")
-    rr = toc.add_run()._r
-    rr.append(begin)
-    rr.append(instr)
-    rr.append(sep)
-    rr.append(placeholder)
-    rr.append(end)
-    doc.add_page_break()
-
-
 FN_MARKER_RE = re.compile(r"\[\[FN:([^:\]\n]+):([^\]\n]+)\]\]")
 
 
@@ -349,34 +317,22 @@ def _ensure_footnote_pr(doc, numbering="continuous"):
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
 
+    fmt = "decimalEnclosedCircleChinese" if numbering == "page" else "decimal"
+    restart = {"page": "eachPage", "chapter": "eachSect"}.get(numbering, "continuous")
     for sec in doc.sections:
-        sect = sec._sectPr
-        old = sect.find(qn("w:footnotePr"))
-        if old is not None:
-            sect.remove(old)
-        fp = OxmlElement("w:footnotePr")
-        pos = OxmlElement("w:pos")
-        pos.set(qn("w:val"), "pageBottom")
-        fp.append(pos)
-        fmt = OxmlElement("w:numFmt")
-        fmt.set(
-            qn("w:val"),
-            "decimalEnclosedCircleChinese" if numbering == "page" else "decimal",
-        )
-        fp.append(fmt)
-        start = OxmlElement("w:numStart")
-        start.set(qn("w:val"), "1")
-        fp.append(start)
-        restart = OxmlElement("w:numRestart")
-        restart.set(
-            qn("w:val"),
-            {"page": "eachPage", "chapter": "eachSect"}.get(numbering, "continuous"),
-        )
-        fp.append(restart)
-        sect.append(fp)
+        fp = _sect_put(sec._sectPr, "footnotePr", {})
+        for tag, val in (
+            ("pos", "pageBottom"),
+            ("numFmt", fmt),
+            ("numStart", "1"),
+            ("numRestart", restart),
+        ):
+            el = OxmlElement("w:" + tag)
+            el.set(qn("w:val"), val)
+            fp.append(el)
 
 
-def _patch_true_footnotes(docx_bytes, note_bank):
+def _patch_true_footnotes(docx_bytes, note_bank, ref_baseline=False):
     """Convert [[FN:scope:id]] markers to true OOXML footnotes at page bottom.
 
     note_bank maps `scope:id` -> note text. Unmatched markers are retained visibly
@@ -437,27 +393,17 @@ def _patch_true_footnotes(docx_bytes, note_bank):
         ppr = etree.SubElement(pp, q(W, "pPr"))
         pst = etree.SubElement(ppr, q(W, "pStyle"))
         pst.set(q(W, "val"), "FootnoteText")
-        spacing = etree.SubElement(ppr, q(W, "spacing"))
-        spacing.set(q(W, "after"), "0")
-        spacing.set(q(W, "line"), "240")
-        spacing.set(q(W, "lineRule"), "auto")
         rr = etree.SubElement(pp, q(W, "r"))
         rpr = etree.SubElement(rr, q(W, "rPr"))
         rst = etree.SubElement(rpr, q(W, "rStyle"))
         rst.set(q(W, "val"), "FootnoteReference")
+        if ref_baseline:
+            # 带圈数字在注释区不必上标，与正文字号对齐更清楚
+            va = etree.SubElement(rpr, q(W, "vertAlign"))
+            va.set(q(W, "val"), "baseline")
         etree.SubElement(rr, q(W, "footnoteRef"))
-        rs = etree.SubElement(pp, q(W, "r"))
-        ts = etree.SubElement(rs, q(W, "t"))
-        ts.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-        ts.text = " "
+        # 编号与文字之间空一格；样式中的悬挂缩进让换行后的文字缩进对齐
         rr2 = etree.SubElement(pp, q(W, "r"))
-        rpr2 = etree.SubElement(rr2, q(W, "rPr"))
-        rf = etree.SubElement(rpr2, q(W, "rFonts"))
-        rf.set(q(W, "ascii"), "Times New Roman")
-        rf.set(q(W, "hAnsi"), "Times New Roman")
-        rf.set(q(W, "eastAsia"), "宋体")
-        sz = etree.SubElement(rpr2, q(W, "sz"))
-        sz.set(q(W, "val"), "18")
         t = etree.SubElement(rr2, q(W, "t"))
         t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
         t.text = " " + text
@@ -506,8 +452,9 @@ def _patch_true_footnotes(docx_bytes, note_bank):
                 rpr = nr.find(q(W, "rPr"))
                 if rpr is None:
                     rpr = etree.SubElement(nr, q(W, "rPr"))
-                rst = etree.SubElement(rpr, q(W, "rStyle"))
+                rst = etree.Element(q(W, "rStyle"))
                 rst.set(q(W, "val"), "FootnoteReference")
+                rpr.insert(0, rst)
                 ref = etree.SubElement(nr, q(W, "footnoteReference"))
                 ref.set(q(W, "id"), str(note_id))
             else:
@@ -620,6 +567,504 @@ def _patch_true_footnotes(docx_bytes, note_bank):
     return out.getvalue(), {"used": used_keys, "unresolved": sorted(set(unresolved))}
 
 
+# ---------- 书稿排版模板 ----------
+#
+# 所有书稿导出共用一套固定版式。格式写在 Word 样式里，打开文档后可在“样式”面板中
+# 统一修改（例如右键“书稿正文”→ 修改），全书随之更新。
+#
+# 字号对照：二号 22pt，三号 16pt，四号 14pt，小四 12pt，五号 10.5pt，小五 9pt。
+
+LATIN_FONT = "Times New Roman"
+
+BOOK_TEMPLATE = {
+    # A4 纸，单位 cm
+    "page": {
+        "width": 21.0,
+        "height": 29.7,
+        "top": 2.6,
+        "bottom": 2.4,
+        "left": 2.8,
+        "right": 2.6,
+        "header": 1.5,
+        "footer": 1.4,
+    },
+    # 目录收录的标题层级
+    "toc_levels": 2,
+    # 样式表：ea 中文字体，size 字号（pt），line 行距（倍数），before/after 段前段后（pt），
+    # first_chars 首行缩进（字符），left/right/hanging 缩进（pt）
+    "styles": [
+        dict(name="Normal", ea="宋体", size=12, line=1.5, after=0),
+        # 第 1 页：书名、副标题、作者、出版信息，整体居中
+        dict(
+            name="书名",
+            ea="黑体",
+            size=22,
+            bold=True,
+            align="center",
+            line=1.3,
+            before=150,
+            after=14,
+        ),
+        dict(name="书稿副标题", ea="宋体", size=16, align="center", line=1.3, after=0),
+        dict(name="作者", ea="楷体", size=14, align="center", line=1.5, before=40),
+        dict(
+            name="出版信息",
+            ea="宋体",
+            size=9,
+            align="center",
+            line=1.5,
+            before=56,
+            left=42,
+            right=42,
+        ),
+        # 第 2 页：目录
+        dict(name="目录标题", ea="黑体", size=16, align="center", line=1.0, after=24),
+        dict(
+            name="toc 1",
+            sid="TOC1",
+            ea="黑体",
+            size=12,
+            line=1.5,
+            before=6,
+            after=0,
+            toc_tab=True,
+        ),
+        dict(
+            name="toc 2",
+            sid="TOC2",
+            ea="宋体",
+            size=12,
+            line=1.5,
+            left=24,
+            after=0,
+            toc_tab=True,
+        ),
+        dict(
+            name="toc 3",
+            sid="TOC3",
+            ea="宋体",
+            size=10.5,
+            line=1.5,
+            left=48,
+            after=0,
+            toc_tab=True,
+        ),
+        # 正文标题
+        dict(
+            name="Heading 1",
+            ea="黑体",
+            size=16,
+            align="center",
+            line=1.3,
+            before=24,
+            after=24,
+            keep=True,
+            outline=0,
+        ),
+        dict(
+            name="Heading 2",
+            ea="黑体",
+            size=14,
+            align="left",
+            line=1.3,
+            before=18,
+            after=12,
+            keep=True,
+            outline=1,
+        ),
+        dict(
+            name="Heading 3",
+            ea="黑体",
+            size=12,
+            align="left",
+            line=1.3,
+            before=12,
+            after=6,
+            keep=True,
+            outline=2,
+        ),
+        # 正文与其他段落
+        dict(
+            name="书稿正文",
+            ea="宋体",
+            size=12,
+            align="justify",
+            line=1.5,
+            first_chars=2,
+        ),
+        dict(
+            name="引文",
+            ea="楷体",
+            size=10.5,
+            align="justify",
+            line=1.5,
+            left=24,
+            right=24,
+            before=6,
+            after=6,
+        ),
+        dict(
+            name="题记",
+            ea="楷体",
+            size=10.5,
+            align="right",
+            line=1.5,
+            left=120,
+            before=12,
+            after=12,
+        ),
+        dict(
+            name="图表标题",
+            ea="黑体",
+            size=10.5,
+            align="center",
+            line=1.3,
+            before=6,
+            after=6,
+        ),
+        dict(
+            name="参考文献",
+            ea="宋体",
+            size=10.5,
+            align="justify",
+            line=1.3,
+            left=21,
+            hanging=21,
+            after=3,
+        ),
+        # 页下注
+        dict(
+            name="footnote text",
+            sid="FootnoteText",
+            ea="宋体",
+            size=9,
+            align="justify",
+            line=1.0,
+            left=13.5,
+            hanging=13.5,
+            after=2,
+        ),
+        # 页眉页脚
+        dict(
+            name="Header",
+            ea="宋体",
+            size=9,
+            align="center",
+            line=1.0,
+            border_bottom=True,
+        ),
+        dict(name="Footer", ea="宋体", size=9, align="center", line=1.0),
+    ],
+}
+
+_SECT_ORDER = [
+    "headerReference",
+    "footerReference",
+    "footnotePr",
+    "endnotePr",
+    "type",
+    "pgSz",
+    "pgMar",
+    "paperSrc",
+    "pgBorders",
+    "lnNumType",
+    "pgNumType",
+    "cols",
+    "formProt",
+    "vAlign",
+    "noEndnote",
+    "titlePg",
+    "textDirection",
+    "bidi",
+    "rtlGutter",
+    "docGrid",
+    "printerSettings",
+    "sectPrChange",
+]
+
+
+def _sect_put(sectPr, tag, attrs=None):
+    """按 OOXML 规定的顺序在 sectPr 中放入（或替换）一个子元素；attrs 为 None 时删除。"""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    for old in sectPr.findall(qn("w:" + tag)):
+        sectPr.remove(old)
+    if attrs is None:
+        return None
+    el = OxmlElement("w:" + tag)
+    for k, v in attrs.items():
+        el.set(qn("w:" + k), str(v))
+    rank = _SECT_ORDER.index(tag)
+    for i, child in enumerate(sectPr):
+        name = child.tag.split("}")[-1]
+        if name in _SECT_ORDER and _SECT_ORDER.index(name) > rank:
+            sectPr.insert(i, el)
+            return el
+    sectPr.append(el)
+    return el
+
+
+def _set_fonts(rPr, east_asia, latin=LATIN_FONT):
+    """直接指定中西文字体，并去掉主题字体属性（主题字体会覆盖直接指定的字体）。"""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    rf = rPr.find(qn("w:rFonts"))
+    if rf is None:
+        rf = OxmlElement("w:rFonts")
+        rPr.insert(0, rf)
+    for a in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme"):
+        rf.attrib.pop(qn("w:" + a), None)
+    for a in ("ascii", "hAnsi", "cs"):
+        rf.set(qn("w:" + a), latin)
+    rf.set(qn("w:eastAsia"), east_asia)
+
+
+def _apply_book_template(doc, T=BOOK_TEMPLATE):
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT, WD_TAB_LEADER
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Cm, Pt, RGBColor
+
+    pg = T["page"]
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = Cm(pg["width"]), Cm(pg["height"])
+    sec.top_margin, sec.bottom_margin = Cm(pg["top"]), Cm(pg["bottom"])
+    sec.left_margin, sec.right_margin = Cm(pg["left"]), Cm(pg["right"])
+    sec.header_distance, sec.footer_distance = Cm(pg["header"]), Cm(pg["footer"])
+    text_width_pt = (pg["width"] - pg["left"] - pg["right"]) / 2.54 * 72
+
+    # 文档默认字体也改为直接指定，避免主题字体在 WPS、LibreOffice 中被替换
+    defaults = doc.styles.element.find(qn("w:docDefaults"))
+    if defaults is not None:
+        rpr = defaults.find(qn("w:rPrDefault") + "/" + qn("w:rPr"))
+        if rpr is not None:
+            _set_fonts(rpr, "宋体")
+
+    align = {
+        "center": WD_ALIGN_PARAGRAPH.CENTER,
+        "left": WD_ALIGN_PARAGRAPH.LEFT,
+        "right": WD_ALIGN_PARAGRAPH.RIGHT,
+        "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
+    }
+    names = {s.name for s in doc.styles}
+    for spec in T["styles"]:
+        name = spec["name"]
+        if name in names:
+            st = doc.styles[name]
+        else:
+            st = doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+            st.base_style = doc.styles["Normal"]
+            st.quick_style = True
+            if spec.get("sid"):
+                st.element.set(qn("w:styleId"), spec["sid"])
+        font = st.font
+        font.size = Pt(spec["size"])
+        font.bold = bool(spec.get("bold"))
+        font.italic = False
+        font.color.rgb = RGBColor(0, 0, 0)
+        _set_fonts(st.element.get_or_add_rPr(), spec["ea"])
+        pf = st.paragraph_format
+        if spec.get("align"):
+            pf.alignment = align[spec["align"]]
+        pf.line_spacing = spec.get("line", 1.5)
+        pf.space_before = Pt(spec.get("before", 0))
+        pf.space_after = Pt(spec.get("after", 0))
+        pf.left_indent = Pt(spec.get("left", 0))
+        pf.right_indent = Pt(spec.get("right", 0))
+        if spec.get("hanging"):
+            pf.first_line_indent = Pt(-spec["hanging"])
+        elif spec.get("first_chars"):
+            pf.first_line_indent = Pt(spec["first_chars"] * spec["size"])
+        else:
+            pf.first_line_indent = Pt(0)
+        pf.keep_with_next = bool(spec.get("keep"))
+        pf.widow_control = True
+        ppr = st.element.get_or_add_pPr()
+        if spec.get("first_chars"):
+            # 按字符缩进：改字号后首行缩进仍是两个字
+            ppr.get_or_add_ind().set(
+                qn("w:firstLineChars"), str(int(spec["first_chars"] * 100))
+            )
+        if name == "Normal":
+            # 不对齐文档网格，否则中文行距会被网格放大
+            snap = OxmlElement("w:snapToGrid")
+            snap.set(qn("w:val"), "0")
+            ppr.insert(0, snap)
+        if "outline" in spec:
+            ol = ppr.find(qn("w:outlineLvl"))
+            if ol is None:
+                ol = OxmlElement("w:outlineLvl")
+                ppr.append(ol)
+            ol.set(qn("w:val"), str(spec["outline"]))
+        if spec.get("toc_tab"):
+            pf.tab_stops.add_tab_stop(
+                Pt(text_width_pt - 1), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS
+            )
+        if spec.get("border_bottom"):
+            bdr = OxmlElement("w:pBdr")
+            bottom = OxmlElement("w:bottom")
+            for k, v in (
+                ("val", "single"),
+                ("sz", "4"),
+                ("space", "4"),
+                ("color", "000000"),
+            ):
+                bottom.set(qn("w:" + k), v)
+            bdr.append(bottom)
+            ppr.append(bdr)
+    # 正文注号：上标
+    if "footnote reference" not in names:
+        ref = doc.styles.add_style("footnote reference", WD_STYLE_TYPE.CHARACTER)
+        ref.element.set(qn("w:styleId"), "FootnoteReference")
+        ref.font.superscript = True
+        _set_fonts(ref.element.get_or_add_rPr(), "宋体")
+    _sort_ppr_children(doc)
+
+
+_PPR_ORDER = [
+    "pStyle",
+    "keepNext",
+    "keepLines",
+    "pageBreakBefore",
+    "framePr",
+    "widowControl",
+    "numPr",
+    "suppressLineNumbers",
+    "pBdr",
+    "shd",
+    "tabs",
+    "suppressAutoHyphens",
+    "kinsoku",
+    "wordWrap",
+    "overflowPunct",
+    "topLinePunct",
+    "autoSpaceDE",
+    "autoSpaceDN",
+    "bidi",
+    "adjustRightInd",
+    "snapToGrid",
+    "spacing",
+    "ind",
+    "contextualSpacing",
+    "mirrorIndents",
+    "suppressOverlap",
+    "jc",
+    "textDirection",
+    "textAlignment",
+    "textboxTightWrap",
+    "outlineLvl",
+    "divId",
+    "cnfStyle",
+    "rPr",
+    "sectPr",
+    "pPrChange",
+]
+
+
+def _sort_ppr_children(doc):
+    """样式里手工加入的段落属性按 OOXML 规定顺序排列，Word 对顺序很严格。"""
+    from docx.oxml.ns import qn
+
+    rank = {n: i for i, n in enumerate(_PPR_ORDER)}
+    for ppr in doc.styles.element.iter(qn("w:pPr")):
+        kids = list(ppr)
+        kids.sort(key=lambda el: rank.get(el.tag.split("}")[-1], len(rank)))
+        for el in kids:
+            ppr.remove(el)
+        for el in kids:
+            ppr.append(el)
+
+
+def _fld_run(paragraph, kind, instr=None, dirty=False):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    r = paragraph.add_run()._r
+    if instr is not None:
+        it = OxmlElement("w:instrText")
+        it.set(qn("xml:space"), "preserve")
+        it.text = instr
+        r.append(it)
+    else:
+        fc = OxmlElement("w:fldChar")
+        fc.set(qn("w:fldCharType"), kind)
+        if dirty:
+            fc.set(qn("w:dirty"), "true")
+        r.append(fc)
+
+
+def _add_toc(doc, entries, levels):
+    """目录页：目录域预先填入各级标题，Word 打开时更新页码。"""
+    doc.add_paragraph("目录", style="目录标题")
+    entries = [(lv, t) for lv, t in entries if lv <= levels]
+    first = doc.add_paragraph(style="toc 1")
+    _fld_run(first, "begin", dirty=True)
+    _fld_run(first, None, instr=f' TOC \\o "1-{levels}" \\h \\z \\u ')
+    _fld_run(first, "separate")
+    last = first
+    if entries:
+        for i, (lv, text) in enumerate(entries):
+            p = first if i == 0 else doc.add_paragraph(style=f"toc {lv}")
+            if i == 0:
+                p.style = doc.styles[f"toc {lv}"]
+            p.add_run(text)
+            last = p
+    else:
+        first.add_run("（目录将在 Word 中打开时自动生成）")
+    _fld_run(last, "end")
+
+
+def _page_field(paragraph, roman=False):
+    _fld_run(paragraph, "begin")
+    _fld_run(paragraph, None, instr=" PAGE \\* ROMAN " if roman else " PAGE ")
+    _fld_run(paragraph, "separate")
+    paragraph.add_run("I" if roman else "1")
+    _fld_run(paragraph, "end")
+
+
+def _setup_book_sections(doc, running_title):
+    """第 1 节书名页（无页眉页码），第 2 节目录（罗马数字页码），
+    第 3 节起为正文（页眉为书名，阿拉伯数字页码从 1 开始）。"""
+    secs = list(doc.sections)
+    for i, sec in enumerate(secs):
+        sp = sec._sectPr
+        _sect_put(sp, "vAlign", None)
+        if i == 1:
+            _sect_put(sp, "pgNumType", {"fmt": "upperRoman", "start": 1})
+        elif i == 2:
+            _sect_put(sp, "pgNumType", {"fmt": "decimal", "start": 1})
+        elif i > 2:
+            _sect_put(sp, "pgNumType", {"fmt": "decimal"})
+        else:
+            _sect_put(sp, "pgNumType", None)
+        sec.different_first_page_header_footer = False
+    # 每一节都写出自己的页眉页脚，不依赖“链接到前一节”，WPS 与 LibreOffice 也能正确显示
+    for i, sec in enumerate(secs):
+        parts = [sec.header, sec.footer]
+        for part in parts:
+            part.is_linked_to_previous = False
+            for p in part.paragraphs:
+                for r in list(p.runs):
+                    r._r.getparent().remove(r._r)
+        if i == 0:
+            sec.header.paragraphs[0].style = doc.styles["Footer"]
+            continue
+        if i >= 2:
+            sec.header.paragraphs[0].add_run(running_title)
+            _page_field(sec.footer.paragraphs[0])
+        else:
+            sec.header.paragraphs[0].style = doc.styles["Footer"]
+            _page_field(sec.footer.paragraphs[0], roman=True)
+
+
+def _strip_note_marks(text):
+    text = FN_MARKER_RE.sub("", text or "")
+    return re.sub(r"[⁰¹²³⁴⁵⁶⁷⁸⁹]+", "", text).strip()
+
+
 def _drop_empty_note_sections(blocks):
     """注释都转成页下注后，原来的“注释”章只剩标题，删去这样的空章节标题。"""
     top = {"part", "chapter", "preface_title", "appendix"}
@@ -713,75 +1158,55 @@ def build_manuscript_docx(data):
     if title_blocks:
         title = title_blocks[0]["text"]
 
+    T = BOOK_TEMPLATE
     doc = Document()
-    sec = doc.sections[0]
-    sec.top_margin = Cm(2.5)
-    sec.bottom_margin = Cm(2.2)
-    sec.left_margin = Cm(2.7)
-    sec.right_margin = Cm(2.4)
-    sec.header_distance = Cm(1.2)
-    sec.footer_distance = Cm(1.2)
+    _apply_book_template(doc, T)
     _set_update_fields(doc)
     cp = doc.core_properties
     cp.title = title
     cp.subject = "中文书稿重建版"
+    if author_blocks:
+        cp.author = author_blocks[0]["text"][:200]
 
-    # Base and heading styles.
-    normal = doc.styles["Normal"]
-    normal.font.name = "Times New Roman"
-    normal._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-    normal.font.size = Pt(10.5)
-    normal.paragraph_format.line_spacing = 1.6
-    normal.paragraph_format.space_after = Pt(0)
-    from docx.shared import RGBColor
-
-    for name, size in [
-        ("Title", 22),
-        ("Heading 1", 16),
-        ("Heading 2", 13),
-        ("Heading 3", 11.5),
-    ]:
-        st = doc.styles[name]
-        st.font.name = "Times New Roman"
-        st._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
-        st.font.size = Pt(size)
-        st.font.bold = True
-        st.font.color.rgb = RGBColor(0, 0, 0)
-
-    # Title page.
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_before = Pt(100)
-    p.paragraph_format.space_after = Pt(20)
-    r = p.add_run(title)
-    _set_run_font(r, east_asia="黑体", size_pt=22, bold=True)
+    # 第 1 页：书名、副标题、作者、出版信息
+    doc.add_paragraph(title, style="书名")
     if subtitle_blocks:
-        p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.paragraph_format.space_after = Pt(22)
-        r = p.add_run(subtitle_blocks[0]["text"])
-        _set_run_font(r, east_asia="宋体", size_pt=14)
-    for b in author_blocks[:3]:
-        p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        r = p.add_run(b["text"])
-        _set_run_font(r, east_asia="楷体", size_pt=12)
-    doc.add_page_break()
-
-    # 版权页只保留引用所需的原书信息
+        doc.add_paragraph(subtitle_blocks[0]["text"], style="书稿副标题")
+    for i, b in enumerate(author_blocks[:3]):
+        p = doc.add_paragraph(b["text"], style="作者")
+        if i:
+            p.paragraph_format.space_before = Pt(4)
     if source_info:
-        p = doc.add_paragraph()
-        p.paragraph_format.space_before = Pt(420)
-        r = p.add_run("原书信息")
-        _set_run_font(r, east_asia="黑体", size_pt=9, bold=True)
-        p = doc.add_paragraph()
-        p.paragraph_format.line_spacing = 1.35
-        r = p.add_run(source_info)
-        _set_run_font(r, east_asia="宋体", size_pt=9)
-        doc.add_page_break()
+        doc.add_paragraph(f"译自：{source_info}", style="出版信息")
 
-    # A rebuilt dynamic TOC; original toc_entry blocks are intentionally omitted.
-    _add_toc_field(doc)
+    # 第 2 页起：目录
+    leftover = (
+        note_report["unmatched_notes"]
+        if true_footnotes
+        else note_report["unmatched_notes"]
+        + [
+            {"page": None, "num": k.split(":", 1)[1], "text": t}
+            for k, t in note_bank.items()
+        ]
+    )
+    level_of = {
+        "part": 1,
+        "chapter": 1,
+        "preface_title": 1,
+        "appendix": 1,
+        "section": 2,
+        "subsection": 3,
+    }
+    toc_entries = [
+        (level_of[b["type"]], _strip_note_marks(b["text"]))
+        for b in blocks
+        if b["type"] in level_of
+    ]
+    if leftover:
+        toc_entries.append((1, "注释" if not true_footnotes else "未能配对的注释"))
+    doc.add_section(WD_SECTION.NEW_PAGE)
+    _add_toc(doc, toc_entries, T["toc_levels"])
+    doc.add_section(WD_SECTION.NEW_PAGE)
 
     skip_types = {
         "book_title",
@@ -793,6 +1218,17 @@ def build_manuscript_docx(data):
         "toc_entry",
         "discard",
         "footnote",
+    }
+    style_of = {
+        "section": "Heading 2",
+        "subsection": "Heading 3",
+        "body": "书稿正文",
+        "blockquote": "引文",
+        "epigraph": "题记",
+        "dedication": "题记",
+        "figure_caption": "图表标题",
+        "table_caption": "图表标题",
+        "bibliography": "参考文献",
     }
     last_type = None
     for b in blocks:
@@ -806,127 +1242,38 @@ def build_manuscript_docx(data):
                     doc.add_section(WD_SECTION.NEW_PAGE)
                 else:
                     doc.add_page_break()
-            p = doc.add_paragraph(style="Heading 1")
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            p.paragraph_format.space_before = Pt(22)
-            p.paragraph_format.space_after = Pt(18)
-            p.paragraph_format.keep_with_next = True
-            r = p.add_run(text)
-            _set_run_font(r, east_asia="黑体", size_pt=16, bold=True)
-        elif typ == "section":
-            p = doc.add_paragraph(style="Heading 2")
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            p.paragraph_format.space_before = Pt(13)
-            p.paragraph_format.space_after = Pt(7)
-            p.paragraph_format.keep_with_next = True
-            r = p.add_run(text)
-            _set_run_font(r, east_asia="黑体", size_pt=13, bold=True)
-        elif typ == "subsection":
-            p = doc.add_paragraph(style="Heading 3")
-            p.paragraph_format.space_before = Pt(9)
-            p.paragraph_format.space_after = Pt(5)
-            p.paragraph_format.keep_with_next = True
-            r = p.add_run(text)
-            _set_run_font(r, east_asia="黑体", size_pt=11.5, bold=True)
-        elif typ == "body":
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            p.paragraph_format.first_line_indent = Pt(21)
-            p.paragraph_format.line_spacing = 1.6
-            p.paragraph_format.space_after = Pt(0)
-            r = p.add_run(text)
-            _set_run_font(r, east_asia="宋体", size_pt=10.5)
-        elif typ == "blockquote":
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            p.paragraph_format.left_indent = Pt(21)
-            p.paragraph_format.right_indent = Pt(21)
-            p.paragraph_format.first_line_indent = Pt(0)
-            p.paragraph_format.space_before = Pt(6)
-            p.paragraph_format.space_after = Pt(6)
-            p.paragraph_format.line_spacing = 1.45
-            r = p.add_run(text)
-            _set_run_font(r, east_asia="楷体", size_pt=10)
-        elif typ in ("epigraph", "dedication"):
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            p.paragraph_format.left_indent = Pt(85)
-            p.paragraph_format.space_before = Pt(16)
-            p.paragraph_format.space_after = Pt(16)
-            p.paragraph_format.line_spacing = 1.35
-            r = p.add_run(text)
-            _set_run_font(r, east_asia="楷体", size_pt=10)
-            r.italic = True
-        elif typ in ("figure_caption", "table_caption"):
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            p.paragraph_format.space_before = Pt(5)
-            p.paragraph_format.space_after = Pt(7)
-            r = p.add_run(text)
-            _set_run_font(r, east_asia="宋体", size_pt=9.5)
-        elif typ == "bibliography":
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            p.paragraph_format.left_indent = Pt(21)
-            p.paragraph_format.hanging_indent = Pt(21)
-            p.paragraph_format.line_spacing = 1.35
-            p.paragraph_format.space_after = Pt(3)
-            r = p.add_run(text)
-            _set_run_font(r, east_asia="宋体", size_pt=9.5)
+            p = doc.add_paragraph(text, style="Heading 1")
+            if typ == "part":
+                # 部标题比章标题大一号，并在页面中上部
+                p.paragraph_format.space_before = Pt(120)
+                p.runs[0].font.size = Pt(18)
         else:
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            p.paragraph_format.first_line_indent = Pt(21)
-            p.paragraph_format.line_spacing = 1.6
-            r = p.add_run(text)
-            _set_run_font(r, east_asia="宋体", size_pt=10.5)
+            doc.add_paragraph(text, style=style_of.get(typ, "书稿正文"))
         last_type = typ
 
     # 注释不会悄悄丢失：没有找到对应注号的注释集中列在书末，供人工核对
-    leftover = (
-        note_report["unmatched_notes"]
-        if true_footnotes
-        else note_report["unmatched_notes"]
-        + [
-            {"page": None, "num": k.split(":", 1)[1], "text": t}
-            for k, t in note_bank.items()
-        ]
-    )
     if leftover:
-        doc.add_page_break()
-        p = doc.add_paragraph(style="Heading 1")
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        r = p.add_run("注释" if not true_footnotes else "未能配对的注释")
-        _set_run_font(r, east_asia="黑体", size_pt=16, bold=True)
+        doc.add_section(WD_SECTION.NEW_PAGE)
+        doc.add_paragraph(
+            "注释" if not true_footnotes else "未能配对的注释", style="Heading 1"
+        )
         for n in leftover:
-            p = doc.add_paragraph()
-            p.paragraph_format.left_indent = Pt(21)
-            p.paragraph_format.first_line_indent = Pt(-21)
-            p.paragraph_format.line_spacing = 1.3
             where = (
                 f"（原书第 {n['page']} 页）" if n.get("page") and true_footnotes else ""
             )
-            r = p.add_run(f"{n['num']}. {n['text']}{where}")
-            _set_run_font(r, east_asia="宋体", size_pt=8.5)
+            doc.add_paragraph(f"{n['num']}. {n['text']}{where}", style="footnote text")
 
-    # Clean output has no inherited source headers/footers; footer contains only page number.
-    _ensure_footnote_pr(doc, data.get("footnote_numbering") or "continuous")
-    for sec in doc.sections:
-        sec.header.is_linked_to_previous = False
-        sec.footer.is_linked_to_previous = False
-        sec.header.paragraphs[0].text = ""
-        p = sec.footer.paragraphs[0]
-        p.text = ""
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        fld = OxmlElement("w:fldSimple")
-        fld.set(qn("w:instr"), "PAGE")
-        p._p.append(fld)
+    numbering = data.get("footnote_numbering") or "continuous"
+    _setup_book_sections(doc, title)
+    _ensure_footnote_pr(doc, numbering)
 
     out = io.BytesIO()
     doc.save(out)
     content = out.getvalue()
     if true_footnotes and note_bank:
-        content, _ = _patch_true_footnotes(content, note_bank)
+        content, _ = _patch_true_footnotes(
+            content, note_bank, ref_baseline=(numbering == "page")
+        )
     return content
 
 

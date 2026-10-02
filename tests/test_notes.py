@@ -169,7 +169,7 @@ def test_word_export_page_and_end_notes_become_true_footnotes():
     doc, fn = _export(blocks)
     assert doc.count("w:footnoteReference") == 2
     assert "Dahl, The Concept of Power." in fn and "Lukes, Power, 23." in fn
-    assert "原书信息" in doc and "Northfield University Press, 2019" in doc
+    assert "译自：" in doc and "Northfield University Press, 2019" in doc
     assert "ISBN" not in doc and "All rights reserved" not in doc
     assert ">注释<" not in doc  # 注释全部转为页下注后，空的“注释”章标题被删去
     assert "[^" not in doc and "[[FN" not in doc
@@ -231,3 +231,43 @@ def test_footnote_numbering_options():
             f'w:numFmt w:val="{fmt}"' in doc
             and f'w:numRestart w:val="{restart}"' in doc
         )
+
+
+def test_book_template_layout():
+    """第 1 节为书名页，第 2 节为目录，第 3 节起为正文；版式写在样式里。"""
+    blocks = [
+        B("book_title", "权力的语法"),
+        B("author", "M. L. 哈特利 著"),
+        B("source_info", "Hartley, M. L. The Grammar of Power. Northfield UP, 2019."),
+        B("chapter", "第一章 权力的概念", 3),
+        B("section", "一、能力与关系", 3),
+        B("body", "权力是一种能力。[^1]", 3),
+        B("footnote", "Dahl, The Concept of Power.", 3, note_id="1", origin="page"),
+        B("chapter", "第二章", 5),
+        B("body", "观念塑造欲望。", 5),
+    ]
+    data = {
+        "mode": "manuscript",
+        "pages": [],
+        "manuscript": {"blocks": blocks},
+        "footnote_numbering": "page",
+    }
+    z = zipfile.ZipFile(io.BytesIO(server.build_manuscript_docx(data)))
+    doc = z.read("word/document.xml").decode()
+    styles = z.read("word/styles.xml").decode()
+    fn = z.read("word/footnotes.xml").decode()
+    sections = doc.split("<w:sectPr")
+    first, second = sections[0], sections[1]
+    assert "权力的语法" in first and "哈特利" in first and "Northfield" in first
+    assert "目录" in second and "第一章 权力的概念" in second and "TOC \\o" in second
+    assert "一、能力与关系" in second and "[[FN" not in second
+    assert 'w:fmt="upperRoman"' in doc and 'w:fmt="decimal" w:start="1"' in doc
+    for name in ("书名", "作者", "出版信息", "目录标题", "书稿正文", "引文"):
+        assert f'w:name w:val="{name}"' in styles
+    assert 'w:styleId="TOC1"' in styles and 'w:styleId="FootnoteText"' in styles
+    assert "asciiTheme" not in styles.split("<w:latentStyles")[0]
+    assert '<w:pStyle w:val="FootnoteText"/>' in fn and "Dahl" in fn
+    assert 'w:hanging="270"' in styles
+    # sectPr 子元素须按规定顺序：footnotePr 在 pgSz 之前
+    for sp in re.findall(r"<w:sectPr.*?</w:sectPr>", doc, re.S):
+        assert sp.index("w:footnotePr") < sp.index("w:pgSz")
