@@ -588,8 +588,9 @@ function splitFootnoteZone(rows, pageH) {
 const CAPTION_RE =
   /^(fig(ure)?\.?|table|tab\.|chart|map|plate|exhibit|图|表)\s*[\dIVXivx一二三四五六七八九十]/i;
 const ASSET_RE = /\[\[(FIG|TABLE):([\w.-]+)\]\]/g;
+// 表格正文是紧跟在开始记号后、以 | 开头的若干行；结束记号缺失时也能识别
 const TABLE_BLOCK_RE =
-  /\[\[TABLE:([\w.-]+)\]\]\s*\n([\s\S]*?)(?:\n\s*\[\[\/TABLE\]\]|$)/g;
+  /\[\[TABLE:([\w.-]+)\]\][ \t]*((?:\n[ \t]*\|[^\n]*)*)(?:\n[ \t]*\[\[\/TABLE\]\])?/g;
 function mulM(m, n) {
   return [
     m[0] * n[0] + m[2] * n[1],
@@ -679,11 +680,12 @@ function rowText(r) {
       (it, j) =>
         it.text +
         (j < r.items.length - 1 &&
-        r.items[j + 1].x - (it.x + it.w) > Math.max(3, it.h * 0.25)
+        (it.ocr || r.items[j + 1].x - (it.x + it.w) > Math.max(3, it.h * 0.25))
           ? " "
           : ""),
     )
     .join("")
+    .replace(/\s+/g, " ")
     .trim();
 }
 function rowBox(r) {
@@ -730,13 +732,7 @@ function buildTable(region, pageW, layout) {
   }
   const cols = bands.length;
   if (cols < 2) return null;
-  const widths = multi.flatMap((x) => x.segs.map((s) => s.x1 - s.x0));
-  if (cols === 2) {
-    // 两列时排除双栏正文和目录页（标题加页码）
-    if (layout === "double" || median(widths) > pageW * 0.25) return null;
-    const second = multi.map((x) => x.segs[x.segs.length - 1].text);
-    if (second.every((t) => /^[\divxlc]{1,5}$/i.test(t.trim()))) return null;
-  }
+  const colW = Array.from({ length: cols }, () => []);
   const grid = region.map((x) => {
     const cells = Array(cols).fill("");
     for (const s of x.segs) {
@@ -748,9 +744,28 @@ function buildTable(region, pageW, layout) {
         if (score > bestOv) ((bestOv = score), (best = k));
       });
       cells[best] = cells[best] ? cells[best] + " " + s.text : s.text;
+      colW[best].push(s.x1 - s.x0);
     }
     return cells;
   });
+  if (cols === 2) {
+    // 两列时排除双栏正文、编号列表和目录页（标题加页码）
+    if (layout === "double") return null;
+    if (Math.max(...colW.map((a) => median(a))) > pageW * 0.3) return null;
+    const first = grid.map((r) => r[0].trim()).filter(Boolean);
+    if (
+      first.length &&
+      first.every((t) =>
+        /^(\d{1,3}[.)、．]|[•·▪◦\-–—]|[a-z][.)]|\(\w{1,4}\)|[ivxlc]{1,5}[.)])$/i.test(
+          t,
+        ),
+      )
+    )
+      return null;
+    const second = grid.map((r) => r[1].trim()).filter(Boolean);
+    if (second.length && second.every((t) => /^[\divxlc]{1,5}$/i.test(t)))
+      return null;
+  }
   if (
     grid.filter((r) => r.filter(Boolean).length >= 2).length <
     region.length * 0.6
@@ -854,6 +869,7 @@ function detectFigures(g, rows, pageW, pageH, tables) {
       (c.solid >= 1 || (c.hz >= 1 && c.vt >= 1))
     )
       regions.push({ x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1, raster: false });
+  for (const r of g.regions || []) regions.push(r);
   // 相互重叠的区域合并，例如图片和它的边框
   for (let merged = true; merged;) {
     merged = false;
@@ -863,6 +879,7 @@ function detectFigures(g, rows, pageW, pageH, tables) {
           regions[a] = {
             ...boxUnion(regions[a], regions[b]),
             raster: regions[a].raster || regions[b].raster,
+            grow: regions[a].grow || regions[b].grow,
           };
           regions.splice(b, 1);
           merged = true;
@@ -880,7 +897,7 @@ function detectFigures(g, rows, pageW, pageH, tables) {
     };
     let box = { x0: reg.x0, y0: reg.y0, x1: reg.x1, y1: reg.y1 };
     let absorbed = boxes.filter((x) => !taken.has(x.r) && inside(x, box));
-    if (!reg.raster) {
+    if (!reg.raster || reg.grow) {
       // 坐标轴刻度、图例等短文字在图形外侧不远处，一并归入图中
       for (let grew = true; grew;) {
         grew = false;
@@ -899,13 +916,402 @@ function detectFigures(g, rows, pageW, pageH, tables) {
     const longRows = absorbed.filter((x) => x.t.length > 60).length;
     if (longRows >= 3 || (absorbed.length && longRows > absorbed.length * 0.5))
       continue;
-    if (!reg.raster && absorbed.length > 30) continue;
+    if ((!reg.raster || reg.grow) && absorbed.length > 30) continue;
     absorbed.forEach((x) => taken.add(x.r));
     out.push({ ...box, raster: reg.raster, rows: absorbed.map((x) => x.r) });
   }
   return out;
 }
+// ---------- 扫描页：根据 OCR 结果和页面图像找出图片与表格 ----------
+// 文字以外成片的深色区域视为插图；按 OCR 单词的位置还原表格的行列
+function analyzeScannedPage(data, img, vp, pageNo) {
+  const pageW = vp.width / vp.scale,
+    pageH = vp.height / vp.scale;
+  const toPdf = (b) => {
+    const [ax, ay] = vp.convertToPdfPoint(b.x0, b.y0),
+      [bx, by] = vp.convertToPdfPoint(b.x1, b.y1);
+    return {
+      x0: Math.min(ax, bx),
+      y0: Math.min(ay, by),
+      x1: Math.max(ax, bx),
+      y1: Math.max(ay, by),
+    };
+  };
+  const allWords = (data.words || []).filter((w) => w.text && w.text.trim());
+  const isRule = (t) => /^[|_\-—–=~.·:;,'"`]+$/.test(t);
+  // 以 OCR 的行为单位，基线相近的行（例如表格同一行的各个单元格）归为一行
+  const rows = [],
+    words = [];
+  // 高度远小于正文行的“行”是表格线、下划线被误认成的文字
+  const lineH = median(
+    (data.lines || []).map((l) => l.bbox.y1 - l.bbox.y0).filter((h) => h > 0),
+  );
+  const thinLine = (ln) =>
+    ln.bbox.y1 - ln.bbox.y0 < lineH * 0.55 && (ln.confidence ?? 0) < 60;
+  for (const ln of data.lines || []) {
+    if (thinLine(ln)) continue;
+    // 置信度很低的“单词”多是表格线、污点被误认成的文字
+    const ws = (ln.words || []).filter(
+      (w) =>
+        w.text && w.text.trim() && !isRule(w.text.trim()) && w.confidence >= 20,
+    );
+    if (!ws.length) continue;
+    const lb = toPdf(ln.bbox),
+      bl =
+        ln.baseline && Number.isFinite(ln.baseline.y0)
+          ? vp.convertToPdfPoint(0, (ln.baseline.y0 + ln.baseline.y1) / 2)[1]
+          : lb.y0 + (lb.y1 - lb.y0) * 0.2,
+      h = (lb.y1 - lb.y0) * 0.8;
+    let row = rows.find((r) => Math.abs(r.y - bl) <= Math.min(h, r.h) * 0.35);
+    if (!row) {
+      row = { y: bl, h, items: [], words: [] };
+      rows.push(row);
+    }
+    for (const w of ws) {
+      const b = toPdf(w.bbox),
+        word = { ...b, text: w.text.trim(), conf: w.confidence, src: w };
+      words.push(word);
+      row.items.push({
+        x: b.x0,
+        w: b.x1 - b.x0,
+        h,
+        text: word.text,
+        ocr: true,
+      });
+      row.words.push(word);
+    }
+  }
+  for (const r of rows) {
+    const order = r.items
+      .map((it, k) => k)
+      .sort((a, b) => r.items[a].x - r.items[b].x);
+    r.items = order.map((k) => r.items[k]);
+    r.words = order.map((k) => r.words[k]);
+  }
+  rows.sort((a, b) => b.y - a.y);
+  rows.bodyH = median(rows.map((r) => r.h)) || 10;
+  let tables = detectTables(rows, pageW, "single");
+
+  // 深色像素网格：每格 4 像素，去掉识别可信的文字后，连成片的部分是插图候选
+  const cell = 4,
+    W = img.width,
+    H = img.height,
+    gw = Math.ceil(W / cell),
+    gh = Math.ceil(H / cell);
+  const ink = new Uint8Array(gw * gh);
+  const px = img.data;
+  // 纸张底色：抽样亮度的较高分位数；明显比纸张暗的像素算作着墨（包括照片的浅色背景）
+  const lum = (i) => px[i] * 0.299 + px[i + 1] * 0.587 + px[i + 2] * 0.114;
+  const sample = [];
+  for (let i = 0; i < px.length; i += 4 * 97) sample.push(lum(i));
+  sample.sort((a, b) => a - b);
+  const paper = sample[Math.floor(sample.length * 0.9)] || 255,
+    darkCut = Math.min(200, paper - 30);
+  for (let gy = 0; gy < gh; gy++)
+    for (let gx = 0; gx < gw; gx++) {
+      let dark = 0,
+        n = 0;
+      for (let y = gy * cell; y < Math.min(H, gy * cell + cell); y++)
+        for (let x = gx * cell; x < Math.min(W, gx * cell + cell); x++) {
+          const i = (y * W + x) * 4;
+          if (lum(i) < darkCut) dark++;
+          n++;
+        }
+      if (dark / n > 0.08) ink[gy * gw + gx] = 1;
+    }
+  // 去掉文字之前保留一份，用来判断表格线
+  const rawInk = ink.slice();
+  for (const w of allWords) {
+    if (w.confidence < 55) continue;
+    const b = w.bbox;
+    for (
+      let gy = Math.max(0, Math.floor(b.y0 / cell) - 1);
+      gy <= Math.min(gh - 1, Math.ceil(b.y1 / cell));
+      gy++
+    )
+      for (
+        let gx = Math.max(0, Math.floor(b.x0 / cell) - 1);
+        gx <= Math.min(gw - 1, Math.ceil(b.x1 / cell));
+        gx++
+      )
+        ink[gy * gw + gx] = 0;
+  }
+  const seen = new Uint8Array(gw * gh),
+    comps = [],
+    R = 2;
+  for (let start = 0; start < ink.length; start++) {
+    if (!ink[start] || seen[start]) continue;
+    const stack = [start];
+    seen[start] = 1;
+    let count = 0,
+      minX = gw,
+      minY = gh,
+      maxX = 0,
+      maxY = 0;
+    while (stack.length) {
+      const c = stack.pop(),
+        cx = c % gw,
+        cy = (c / gw) | 0;
+      count++;
+      if (cx < minX) minX = cx;
+      if (cx > maxX) maxX = cx;
+      if (cy < minY) minY = cy;
+      if (cy > maxY) maxY = cy;
+      for (let dy = -R; dy <= R; dy++)
+        for (let dx = -R; dx <= R; dx++) {
+          const nx = cx + dx,
+            ny = cy + dy;
+          if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+          const k = ny * gw + nx;
+          if (ink[k] && !seen[k]) {
+            seen[k] = 1;
+            stack.push(k);
+          }
+        }
+    }
+    comps.push({
+      count,
+      x0: minX * cell,
+      y0: minY * cell,
+      x1: (maxX + 1) * cell,
+      y1: (maxY + 1) * cell,
+    });
+  }
+  const edge = 0.02;
+  // 带完整表格线（横线三条以上、竖线两条以上）的区域是表格，以表格线围成的范围为准
+  const lineCounts = (c) => {
+    const x0 = c.x0 / cell,
+      x1 = c.x1 / cell,
+      y0 = c.y0 / cell,
+      y1 = c.y1 / cell;
+    const runs = (n, full) => {
+      let lines = 0,
+        prev = false;
+      for (let k = 0; k < n; k++) {
+        const on = full(k);
+        if (on && !prev) lines++;
+        prev = on;
+      }
+      return lines;
+    };
+    // 扫描页常有轻微倾斜，一条线可能跨过相邻几格，所以按 3 格宽的条带统计
+    const T = 3;
+    const hl = runs(y1 - y0, (k) => {
+      let n = 0;
+      for (let x = x0; x < x1; x++) {
+        let on = 0;
+        for (let d = 0; d < T && y0 + k + d < y1; d++)
+          on |= rawInk[(y0 + k + d) * gw + x];
+        n += on;
+      }
+      return n >= (x1 - x0) * 0.8;
+    });
+    const vl = runs(x1 - x0, (k) => {
+      let n = 0;
+      for (let y = y0; y < y1; y++) {
+        let on = 0;
+        for (let d = 0; d < T && x0 + k + d < x1; d++)
+          on |= rawInk[y * gw + x0 + k + d];
+        n += on;
+      }
+      return n >= (y1 - y0) * 0.8;
+    });
+    return { hl, vl };
+  };
+  for (const c of comps) {
+    const b = toPdf(c);
+    if (c.count < 40 || boxW(b) < 80 || boxH(b) < 30) continue;
+    const { hl, vl } = lineCounts(c);
+    // 图表外框只有上下两条横线；表格至少还有表头下的一条
+    if (hl < 3 || vl < 2) continue;
+    tables = tables.filter((t) => !boxNear(t.bbox, b));
+    const inRows = rows.filter((r) => {
+      const rb = rowBox(r),
+        cx = (rb.x0 + rb.x1) / 2,
+        cy = (rb.y0 + rb.y1) / 2;
+      return cx >= b.x0 && cx <= b.x1 && cy >= b.y0 && cy <= b.y1;
+    });
+    if (inRows.length < 2) continue;
+    const t = buildTable(
+      inRows.map((r) => ({ r, segs: rowSegments(r) })),
+      pageW,
+      "single",
+    ) || { rows: inRows, grid: [], bbox: b };
+    t.bbox = boxUnion(t.bbox, b);
+    tables.push(t);
+  }
+  // 识别质量差的表格（表格线干扰、字迹模糊）不还原行列，导出时使用原表截图
+  for (const t of tables) {
+    const ws = t.rows.flatMap((r) => r.words);
+    const conf = ws.length
+      ? ws.reduce((sum, w) => sum + w.conf, 0) / ws.length
+      : 0;
+    const junk = ws.filter((w) => /[\[\]{}|]/.test(w.text)).length;
+    if (conf < 70 || junk > ws.length * 0.1) t.grid = [];
+  }
+  tables.sort((a, b) => b.bbox.y1 - a.bbox.y1);
+  const tableRows = new Set(tables.flatMap((t) => t.rows));
+  // 表格上下的横线也截进表格图中
+  for (const t of tables)
+    for (const c of comps) {
+      const b = toPdf(c);
+      if (
+        boxH(b) < 6 &&
+        boxW(b) > boxW(t.bbox) * 0.5 &&
+        b.x0 < t.bbox.x1 &&
+        b.x1 > t.bbox.x0 &&
+        b.y0 >= t.bbox.y0 - 16 &&
+        b.y1 <= t.bbox.y1 + 16
+      )
+        t.bbox = boxUnion(t.bbox, b);
+    }
+  const tboxes = tables.map((t) => boxPad(t.bbox, 14));
+  const regions = [];
+  for (const c of comps) {
+    if (c.count < 80) continue;
+    // 扫描时留下的页边阴影、装订线
+    if (
+      c.x0 < W * edge ||
+      c.y0 < H * edge ||
+      c.x1 > W * (1 - edge) ||
+      c.y1 > H * (1 - edge)
+    )
+      continue;
+    const b = toPdf(c);
+    if (boxW(b) < 60 || boxH(b) < 40) continue;
+    if (boxW(b) / boxH(b) > 12 || boxH(b) / boxW(b) > 12) continue;
+    if (
+      tboxes.some(
+        (t) => b.x0 >= t.x0 && b.x1 <= t.x1 && b.y0 >= t.y0 && b.y1 <= t.y1,
+      )
+    )
+      continue;
+    if (boxW(b) * boxH(b) > pageW * pageH * 0.8) continue;
+    // 大部分面积被识别出的文字占据的，是印刷质量差的正文，不当作图
+    const covered = words
+      .filter((w) => boxNear(w, b))
+      .reduce(
+        (s, w) =>
+          s +
+          Math.max(0, Math.min(w.x1, b.x1) - Math.max(w.x0, b.x0)) *
+            Math.max(0, Math.min(w.y1, b.y1) - Math.max(w.y0, b.y0)),
+        0,
+      );
+    if (covered > boxW(b) * boxH(b) * 0.45) continue;
+    regions.push({ ...b, raster: true, grow: true });
+  }
+  // 图形旁边的零散小块（坐标轴刻度数字、图例）一并归入图中
+  for (const reg of regions)
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const c of comps) {
+        if (c.count < 3 || c.used) continue;
+        const b = toPdf(c);
+        if (boxW(b) > 80 || boxH(b) > 40) continue;
+        if (!boxNear(b, reg, 14)) continue;
+        if (
+          b.x0 >= reg.x0 &&
+          b.x1 <= reg.x1 &&
+          b.y0 >= reg.y0 &&
+          b.y1 <= reg.y1
+        )
+          continue;
+        Object.assign(reg, boxUnion(reg, b));
+        c.used = true;
+        grew = true;
+      }
+    }
+  const figures = detectFigures(
+    { images: [], paths: [], regions },
+    rows.filter((r) => !tableRows.has(r)),
+    pageW,
+    pageH,
+    tables,
+  );
+  // 被表格或插图占用的单词（OCR 结果中同一单词在不同层级是不同对象，按位置对应）
+  const wkey = (w) => `${w.bbox.x0},${w.bbox.y0},${w.bbox.x1},${w.bbox.y1}`;
+  const owner = new Map();
+  tables.forEach((t, k) => {
+    t.id = `${pageNo}-${k + 1}`;
+    for (const r of t.rows) for (const w of r.words) owner.set(wkey(w.src), t);
+  });
+  figures.forEach((f, k) => {
+    f.id = `${pageNo}-${k + 1}`;
+    for (const r of f.rows) for (const w of r.words) owner.set(wkey(w.src), f);
+  });
+  const marker = (reg) =>
+    tables.includes(reg) ? tableToText(reg.id, reg.grid) : `[[FIG:${reg.id}]]`;
+  const regionBox = (reg) => (tables.includes(reg) ? reg.bbox : reg);
+  // 按 OCR 的阅读顺序重组文字：区域内的行去掉，在区域开始处放入图表记号
+  const lines = [];
+  for (const blk of data.blocks || [])
+    for (const para of blk.paragraphs || []) {
+      para.lines.forEach((ln, i) => lines.push({ ln, para, first: i === 0 }));
+    }
+  const pending = new Set([...tables, ...figures]);
+  const out = [];
+  let cur = [];
+  const flush = () => {
+    if (cur.length) out.push(cur.join("\n"));
+    cur = [];
+  };
+  let prevBox = null;
+  for (const { ln, first } of lines) {
+    if (first) flush();
+    if (thinLine(ln)) continue;
+    // 行距明显变大或图题、表题所在的行，另起一段
+    const nb = toPdf(ln.bbox);
+    if (
+      prevBox &&
+      (prevBox.y0 - nb.y1 > (nb.y1 - nb.y0) * 0.9 ||
+        CAPTION_RE.test((ln.text || "").trim()))
+    )
+      flush();
+    prevBox = nb;
+    const ws = (ln.words || []).filter((w) => w.text && w.text.trim());
+    const regs = ws.map((w) => owner.get(wkey(w))).filter(Boolean);
+    const lb = toPdf(ln.bbox),
+      cx = (lb.x0 + lb.x1) / 2,
+      cy = (lb.y0 + lb.y1) / 2;
+    const within = (rb) =>
+      cx >= rb.x0 - 2 && cx <= rb.x1 + 2 && cy >= rb.y0 - 2 && cy <= rb.y1 + 2;
+    // 本行之前应当出现的区域：本行已经进入区域，或区域在本行上方且水平方向有重叠
+    for (const reg of [...pending]) {
+      const rb = regionBox(reg);
+      const inside = regs.includes(reg) || within(rb);
+      const above = rb.y0 >= lb.y1 - 2 && rb.x0 < lb.x1 && rb.x1 > lb.x0;
+      if (inside || above) {
+        flush();
+        out.push(marker(reg));
+        pending.delete(reg);
+      }
+    }
+    if (ws.length && regs.length >= ws.length * 0.5) continue;
+    if ([...tables, ...figures].some((reg) => within(regionBox(reg)))) continue;
+    const t = (ln.text || "").trim();
+    if (t) cur.push(t);
+    if (CAPTION_RE.test(t)) flush();
+  }
+  flush();
+  for (const reg of pending) out.push(marker(reg));
+  const assets = [
+    ...tables.map((t) => ({
+      id: `TABLE:${t.id}`,
+      kind: "table",
+      bbox: t.bbox,
+      rows: t.grid,
+    })),
+    ...figures.map((f) => ({
+      id: `FIG:${f.id}`,
+      kind: "figure",
+      bbox: { x0: f.x0, y0: f.y0, x1: f.x1, y1: f.y1 },
+      raster: true,
+    })),
+  ];
+  return { text: out.join("\n\n"), assets };
+}
 function tableToText(id, grid) {
+  if (!grid.length) return `[[TABLE:${id}]]\n[[/TABLE]]`;
   return (
     `[[TABLE:${id}]]\n` +
     grid
@@ -1212,24 +1618,44 @@ async function parsePage(idx) {
   if (useOCR) {
     markStep(2);
     status(`OCR 第 ${idx + 1} 页…`);
-    await renderPage(idx + 1);
     const ocrLang = $("ocrLang").value;
-    const result = await Tesseract.recognize(
-      $("pdfCanvas").toDataURL("image/png"),
-      ocrLang,
-      {
-        ...(await tesseractOptions(ocrLang)),
-        logger: (m) => {
-          if (m.status === "recognizing text")
-            progress(
-              Math.round((m.progress || 0) * 100),
-              100,
-              `OCR 第 ${idx + 1} 页`,
-            );
-        },
+    // 在独立画布上以约 144 dpi 渲染页面，供 OCR 和图表识别使用（不受翻页影响）
+    const ocrPage = await state.pdf.getPage(idx + 1),
+      ocrVp = ocrPage.getViewport({ scale: 2 }),
+      canvas = document.createElement("canvas");
+    canvas.width = Math.ceil(ocrVp.width);
+    canvas.height = Math.ceil(ocrVp.height);
+    const octx = canvas.getContext("2d");
+    octx.fillStyle = "#fff";
+    octx.fillRect(0, 0, canvas.width, canvas.height);
+    await ocrPage.render({ canvasContext: octx, viewport: ocrVp }).promise;
+    const pageImage = octx.getImageData(0, 0, canvas.width, canvas.height),
+      pageUrl = canvas.toDataURL("image/png");
+    canvas.width = canvas.height = 0;
+    const result = await Tesseract.recognize(pageUrl, ocrLang, {
+      ...(await tesseractOptions(ocrLang)),
+      logger: (m) => {
+        if (m.status === "recognizing text")
+          progress(
+            Math.round((m.progress || 0) * 100),
+            100,
+            `OCR 第 ${idx + 1} 页`,
+          );
       },
-    );
-    s = { layout: "ocr", blocks: [], text: cleanText(result.data.text) };
+    });
+    let scan = null;
+    try {
+      if (result.data.blocks?.length)
+        scan = analyzeScannedPage(result.data, pageImage, ocrVp, idx + 1);
+    } catch (e) {
+      log(`第 ${idx + 1} 页图表识别失败：${e.message}`);
+    }
+    s = {
+      layout: "ocr",
+      blocks: [],
+      text: cleanText(scan ? scan.text : result.data.text),
+      assets: scan?.assets || [],
+    };
     state.pages[idx].ocr = true;
     log(`第 ${idx + 1} 页启用 OCR，${s.text.length} 字符。`);
   } else
@@ -1239,7 +1665,7 @@ async function parsePage(idx) {
   // 重新解析时先清掉这一页原有的图表
   for (const k of Object.keys(state.assets))
     if (state.assets[k].page === idx + 1) delete state.assets[k];
-  if (!useOCR && s.assets?.length) {
+  if (s.assets?.length) {
     try {
       const crops = await cropRegions(idx, s.assets);
       for (const a of s.assets)
@@ -2251,7 +2677,7 @@ function base() {
 function richHTML(text) {
   text = text || "";
   const re =
-    /\[\[TABLE:([\w.-]+)\]\]\s*\n([\s\S]*?)(?:\n\s*\[\[\/TABLE\]\]|$)|\[\[FIG:([\w.-]+)\]\]/g;
+    /\[\[TABLE:([\w.-]+)\]\][ \t]*((?:\n[ \t]*\|[^\n]*)*)(?:\n[ \t]*\[\[\/TABLE\]\])?|\[\[FIG:([\w.-]+)\]\]/g;
   const parts = [];
   let last = 0;
   for (const m of text.matchAll(re)) {

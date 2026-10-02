@@ -1,4 +1,4 @@
-# Scholar PDF Translator v2.11
+# Scholar PDF Translator v2.12
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -41,7 +41,7 @@ After manuscript reconstruction the same material becomes a continuous Chinese b
 - **Two-pass AI processing.** A translation pass with cross-page context, followed by a proofreading pass that re-reads source and translation together to catch omissions, mistranslations, OCR errors, names, numbers and terminology drift. A glossary and custom instructions can be supplied.
 - **Manuscript reconstruction.** The translated text is re-segmented into book title, author, parts, chapters, sections, body text, block quotations, captions, notes, bibliography and appendices.
 - **Real footnotes.** Chapter endnotes and book endnotes are paired with their note markers and exported as native Word footnotes.
-- **Figures and tables.** Figures (raster images and vector charts) are located from the page drawing operations, cropped and placed back in the Word manuscript beside their captions. Tables are rebuilt as rows and columns from text alignment, translated cell by cell and exported as three-line academic tables; when a translated table cannot be parsed, the original table image is used. Scanned pages are not covered yet.
+- **Figures and tables.** Figures (raster images and vector charts) are located from the page drawing operations, cropped and placed back in the Word manuscript beside their captions. Tables are rebuilt as rows and columns from text alignment, translated cell by cell and exported as three-line academic tables; when a translated table cannot be parsed, the original table image is used. On scanned pages, figures are found as inked regions outside the recognized text, and tables are rebuilt from OCR word positions or from their ruling lines; tables that OCR reads poorly fall back to the original image.
 - **Fixed book layout.** Every Chinese manuscript uses the same Word template: page 1 carries the title, author and source citation; page 2 holds the table of contents; body text, headings, block quotations and footnotes have fixed fonts, sizes and line spacing. All settings live in named Word styles, so changing a style updates the whole book. Developers can adjust `BOOK_TEMPLATE` in `docx_export.py`.
 - **Exports.** Continuous Chinese manuscript (.docx), side-by-side bilingual Word, translated or bilingual HTML, and a project JSON file.
 - **Start from an existing translation.** Import bilingual HTML, translated HTML, .docx or project JSON to skip OCR and translation and go straight to reconstruction.
