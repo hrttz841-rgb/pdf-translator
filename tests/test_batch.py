@@ -21,7 +21,8 @@ def folder(tmp_path):
     (root / "旧书_中文书稿版.docx").write_bytes(b"x")
     (root / "译文").mkdir()
     (root / "译文" / "a_中文书稿版.docx").write_bytes(b"done")
-    return root
+    # macOS 的临时目录经由符号链接（/var → /private/var），服务端返回的是解析后的路径
+    return root.resolve()
 
 
 @pytest.fixture()
@@ -48,16 +49,17 @@ def test_list_folder_finds_supported_files_and_skips_outputs(srv, folder):
     assert obj["out_dir"] == str(folder / "译文")
 
 
-@pytest.mark.parametrize(
-    "fmt", ["'{p}'", '"{p}"', "file://{p}", "{p}/"]
-)
+@pytest.mark.parametrize("fmt", ["'{p}'", '"{p}"', "{uri}", "{p}/"])
 def test_list_folder_accepts_quoted_and_url_paths(srv, folder, fmt):
-    text = fmt.format(p=str(folder).replace(" ", "%20") if fmt.startswith("file") else str(folder))
+    text = fmt.format(p=str(folder), uri=folder.as_uri())
     r, data = post(srv, "/api/folder/list", {"path": text})
     assert r.status == 200, data
     assert len(json.loads(data)["files"]) == 3
 
 
+@pytest.mark.skipif(
+    batch_io.os.sep != "/", reason="Windows 路径以反斜杠分隔"
+)
 def test_list_folder_escaped_spaces(srv, folder):
     r, data = post(srv, "/api/folder/list", {"path": str(folder).replace(" ", "\\ ")})
     assert r.status == 200, data

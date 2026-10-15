@@ -44,8 +44,8 @@ def _clean_path_text(text):
         # file:///C:/Users/... 在 Windows 上解析为 /C:/Users/...
         if re.match(r"^/[A-Za-z]:/", t):
             t = t[1:]
-    # 终端里拖入的路径会把空格写成 "\ "
-    if platform.system() != "Windows":
+    # 终端里拖入的路径会把空格写成 "\ "（Windows 路径本身用反斜杠分隔，不做这一步）
+    if os.sep == "/":
         t = re.sub(r"\\(.)", r"\1", t)
     return t
 
