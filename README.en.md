@@ -1,4 +1,4 @@
-# Scholar PDF Translator v2.12
+# Scholar PDF Translator v2.13
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -15,6 +15,14 @@ Most AI translation workflows stop once each sentence has been translated. For l
 </p>
 
 The interface follows the processing pipeline. The stage bar at the top shows progress for parsing, cleanup, translation, proofreading, manuscript reconstruction and human review, and each stage can be run on its own. A full run can be paused and resumed without re-sending finished pages to the model; a failing page is flagged instead of stopping the whole book, and failed pages can be retried in one click. The page list marks every page's status and can be filtered to untranslated, unproofed, unreviewed or failed pages. The source can be viewed as the page image with detected text blocks, as editable text, or side by side with the translation paragraph by paragraph. Before a manuscript is exported, a preview lists the detected chapter tree and flags notes that could not be paired. Keyboard shortcuts: `Alt+←/→` to change page, `Ctrl/⌘+Enter` to translate the page, `Ctrl/⌘+Shift+Enter` to mark it reviewed and move on, `?` for the full list. Dark mode follows the system setting.
+
+## Chat mode: hand it a folder
+
+Since v2.13 the tool opens on a chat window. Drag a folder (or a few files) into it, click "选择文件夹" (choose folder), or paste a folder path such as `~/Downloads/literature`. Every supported file in the folder and its subfolders (PDF, .docx, HTML and the tool's own `.translation-project.json`) is processed in turn: parsing and OCR, cleanup, translation, proofreading, manuscript reconstruction and export. A queue card in the conversation shows each file's stage and the estimated time left. Word and HTML files are checked automatically: originals are translated first, existing translations go straight to reconstruction.
+
+Results are written to disk by the local service. For a pasted path they go into a new `译文` subfolder of that folder, mirroring its subfolders; for a dropped or chosen folder they go into `Documents/Scholar PDF Translator 译文/<folder name>` (override with `PDF_TRANSLATOR_OUTPUT`). Each file yields `<name>_中文书稿版.docx` and `<name>.translation-project.json`, optionally also `<name>_原文译文对照版.docx`. Files that are already done are skipped, so resending the same folder resumes an interrupted batch. Open a project file in the workbench to review pages one by one.
+
+Translation requirements can be given in plain language ("these are French, skip proofreading, also export a bilingual version, translate sovereignty as 主权"); the configured model turns them into settings and the reply lists what changed. "暂停", "继续", "进度", "重试" and "打开文件夹" (pause, resume, progress, retry failed files, open output folder) work during processing. The page-by-page workbench is unchanged and one click away in the top bar. Processing runs in the browser tab, so keep it open; if the computer sleeps, say "继续" (resume) after it wakes.
 
 ## Before and after
 
@@ -77,11 +85,15 @@ The local service listens on `127.0.0.1` only and protects your keys from other 
 - a random per-launch session token, injected only into the tool's own page, is required on every API call;
 - a saved key is only ever sent to the API base registered when it was saved (or the provider's default). To use a different endpoint, re-enter and save the key.
 
+In chat mode the local service also reads and writes files, limited to supported files inside folders sent during the current run and to their output folders. Folders are referred to by random IDs and every relative path is re-validated so it cannot leave those directories.
+
 ## Development
 
 | File | Purpose |
 | --- | --- |
 | `index.html`, `app.js`, `styles.css` | Browser UI, PDF parsing, OCR and workflow |
+| `chat.js` | Chat mode: conversation, batch queue, folder and path input |
+| `batch_io.py` | Chat mode file access: list folders, read files, write results |
 | `server.py` | Local HTTP server entry point and access control |
 | `providers.py` | Provider presets |
 | `keystore.py` | Credential storage and allowed-endpoint registry |
@@ -104,5 +116,6 @@ This is an evolving research tool. Complex scans, mathematical notation, unusual
 
 - [@hrttz841-rgb](https://github.com/hrttz841-rgb): project lead, product design, academic use cases and maintenance
 - OpenAI ChatGPT: prototyping, code iteration, documentation and testing
+- Anthropic Claude: design, development and testing of chat mode and batch processing
 
 Issues and pull requests are welcome, especially on OCR, layout analysis, footnote recovery, academic terminology, Word typesetting and model support.

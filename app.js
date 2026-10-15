@@ -82,6 +82,8 @@ const state = {
 // 供自动化测试读取当前项目状态
 window.SPT = { state };
 const persistIds = [
+  "batchManuscript",
+  "batchBilingual",
   "footnoteNumbering",
   "concurrency",
   "backend",
@@ -106,18 +108,31 @@ const persistIds = [
   "glossary",
   "customPrompt",
 ];
+// 对话界面通过 engine.onActivity 订阅处理过程中的状态、进度和记录
+const activityListeners = new Set();
+function emitActivity(ev) {
+  for (const fn of activityListeners)
+    try {
+      fn(ev);
+    } catch (e) {
+      console.warn(e);
+    }
+}
 function log(s) {
   const t = new Date().toLocaleTimeString();
   $("log").textContent += `\n[${t}] ${s}`;
   $("log").scrollTop = $("log").scrollHeight;
+  emitActivity({ type: "log", text: s });
 }
 function status(s) {
   $("status").textContent = s;
+  emitActivity({ type: "status", text: s });
 }
 function progress(i, n, label) {
   const p = n ? Math.round((i / n) * 100) : 0;
   $("progressBar").style.width = p + "%";
   $("progressText").textContent = `${label} ${i}/${n} (${p}%)`;
+  emitActivity({ type: "progress", done: i, total: n, label });
 }
 const STEP_STAGE = {
   1: "parse",
@@ -251,6 +266,37 @@ function activateImportedProject(name, pages, kind, unit = "chunk") {
   showPage(0);
   updateControls();
 }
+// DOMParser 得到的文档没有渲染，innerText 不会按段落换行：按块级元素和 <br> 自行拼出文字
+const BLOCK_TAGS = new Set(
+  "P DIV H1 H2 H3 H4 H5 H6 LI BLOCKQUOTE TR SECTION ARTICLE FIGURE FIGCAPTION TABLE UL OL PRE HEADER FOOTER ASIDE MAIN DD DT".split(
+    " ",
+  ),
+);
+function blockText(node) {
+  const out = [];
+  const walk = (n) => {
+    if (n.nodeType === 3) {
+      out.push(n.nodeValue.replace(/\s+/g, " "));
+      return;
+    }
+    if (n.nodeType !== 1 || /^(SCRIPT|STYLE|HEAD|TITLE)$/.test(n.tagName)) return;
+    if (n.tagName === "BR") {
+      out.push("\n");
+      return;
+    }
+    const block = BLOCK_TAGS.has(n.tagName);
+    if (block) out.push("\n\n");
+    else if (n.tagName === "TD" || n.tagName === "TH") out.push(" ");
+    for (const c of n.childNodes) walk(c);
+    if (block) out.push("\n\n");
+  };
+  walk(node);
+  return out
+    .join("")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 function htmlToImportedPages(html) {
   const doc = new DOMParser().parseFromString(html, "text/html");
   const sections = [...doc.querySelectorAll("section.page")];
@@ -263,7 +309,7 @@ function htmlToImportedPages(html) {
           const body = (a) => {
             const c = a?.cloneNode(true);
             c?.querySelectorAll("h3,.pn").forEach((x) => x.remove());
-            return (c?.innerText || "").trim();
+            return c ? blockText(c) : "";
           };
           return { n: i + 1, source: body(arts[0]), target: body(arts[1]) };
         }
@@ -273,7 +319,7 @@ function htmlToImportedPages(html) {
         return {
           n: i + 1,
           source: "",
-          target: (c?.innerText || sec.innerText || "").trim(),
+          target: c ? blockText(c) : blockText(sec),
         };
       })
       .filter((p) => p.source || p.target);
@@ -285,7 +331,7 @@ function htmlToImportedPages(html) {
       pages,
     };
   }
-  const text = (doc.body?.innerText || "").trim();
+  const text = doc.body ? blockText(doc.body) : "";
   if (!text) throw new Error("HTML 中没有识别到正文");
   const chunks = [];
   let cur = "";
@@ -2151,7 +2197,12 @@ async function stageTranslate() {
 async function stageProof() {
   const todo = state.pages
     .map((p, i) => i)
-    .filter((i) => state.pages[i].translated && !state.pages[i].proofed);
+    .filter(
+      (i) =>
+        state.pages[i].translated &&
+        !state.pages[i].proofed &&
+        state.pages[i].source.trim(),
+    );
   return runPages("proof", "校对", todo, (i) => proofPage(i));
 }
 function finishRun(results, doneMsg) {
@@ -2747,6 +2798,22 @@ function assetPayload(mode) {
   }
   return out;
 }
+function docxPayload(mode) {
+  return {
+    mode: mode === "bilingual" ? "bilingual" : "manuscript",
+    file_name: state.fileName,
+    title: base(),
+    pages: state.pages.map((p) => ({
+      n: p.n,
+      source: p.source,
+      target: p.target,
+    })),
+    manuscript: mode === "bilingual" ? null : state.manuscript,
+    assets: assetPayload(mode),
+    true_footnotes: $("trueFootnotes").checked,
+    footnote_numbering: $("footnoteNumbering").value,
+  };
+}
 async function downloadDocx(mode) {
   const btn = $("exportMenuBtn");
   btn.disabled = true;
@@ -2754,20 +2821,7 @@ async function downloadDocx(mode) {
     status(
       mode === "bilingual" ? "正在生成对照 Word…" : "正在生成中文书稿 Word…",
     );
-    const payload = {
-      mode: mode === "bilingual" ? "bilingual" : "manuscript",
-      file_name: state.fileName,
-      title: base(),
-      pages: state.pages.map((p) => ({
-        n: p.n,
-        source: p.source,
-        target: p.target,
-      })),
-      manuscript: mode === "bilingual" ? null : state.manuscript,
-      assets: assetPayload(mode),
-      true_footnotes: $("trueFootnotes").checked,
-      footnote_numbering: $("footnoteNumbering").value,
-    };
+    const payload = docxPayload(mode);
     const r = await apiFetch("/api/export-docx", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2798,9 +2852,8 @@ async function downloadDocx(mode) {
     updateControls();
   }
 }
-function exportProject() {
-  syncEditors();
-  const obj = {
+function projectObject() {
+  return {
     version: 5,
     fileName: state.fileName,
     settings: Object.fromEntries(
@@ -2837,6 +2890,10 @@ function exportProject() {
       }),
     ),
   };
+}
+function exportProject() {
+  syncEditors();
+  const obj = projectObject();
   download(
     base() + ".translation-project.json",
     new Blob([JSON.stringify(obj, null, 2)], {
@@ -2990,7 +3047,7 @@ function canRunAll() {
 function updateControls() {
   const has = state.pages.length > 0,
     pdf = !!state.pdf,
-    busy = !!state.busy;
+    busy = !!state.busy || !!state.batchActive;
   const hasTarget = state.pages.some((p) => p.target && p.target.trim());
   const hasPairs = state.pages.some((p) => p.source && p.target);
   const canTranslate = pdf || state.pages.some((p) => p.source.trim());
@@ -3179,8 +3236,12 @@ function closeExportMenu() {
 async function handleFile(f) {
   if (!f) return;
   const ext = (f.name.split(".").pop() || "").toLowerCase();
-  if (state.busy) {
-    notify("正在处理中，请先暂停当前任务");
+  if (state.busy || state.batchActive) {
+    notify(
+      state.batchActive
+        ? "对话中的批量任务正在进行，请先在对话里暂停"
+        : "正在处理中，请先暂停当前任务",
+    );
     return;
   }
   if (
@@ -3595,3 +3656,261 @@ window.addEventListener("pagehide", () => {
     idbPut(projectSnapshot()).catch(() => {});
 });
 offerRestore();
+
+// ---------- 供对话界面（chat.js）调用的处理引擎 ----------
+// 对话界面逐个文件调用：loadFile → run → exportTo，复用工作台的全部解析、翻译、校对与书稿重建逻辑。
+const CJK_RE = /[㐀-鿿豈-﫿]/g;
+function cjkRatio(text) {
+  const t = (text || "").replace(/\s+/g, "");
+  if (!t) return 0;
+  return (t.match(CJK_RE) || []).length / t.length;
+}
+// 导入的 Word / HTML 可能是待翻译的原文，也可能是已有译文：按文字是否已是目标语言判断
+function looksUntranslated(pages) {
+  const sample = pages
+    .map((p) => p.target || "")
+    .join("\n")
+    .slice(0, 20000);
+  const r = cjkRatio(sample);
+  return $("targetLang").value === "en" ? r > 0.3 : r < 0.15;
+}
+async function engineLoadFile(file) {
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+  // 批量处理会依次载入很多文件，先释放上一个 PDF 占用的内存
+  if (state.pdf)
+    try {
+      await renderQueue;
+      await state.pdf.destroy();
+    } catch (e) {}
+  state.pdf = null;
+  if (ext === "pdf" || file.type === "application/pdf") {
+    await loadPdf(file);
+    return { kind: "pdf", pages: state.pages.length };
+  }
+  await importExisting(file);
+  const isProject = /\.json$/i.test(file.name);
+  if (
+    !isProject &&
+    state.importMode !== "bilingual" &&
+    looksUntranslated(state.pages)
+  ) {
+    // 当作原文：译文栏的内容移到原文栏，等待翻译
+    for (const p of state.pages)
+      Object.assign(p, {
+        raw: p.target,
+        source: p.target,
+        target: "",
+        translated: false,
+        proofed: false,
+        approved: false,
+      });
+    state.importMode = "source";
+    state.manuscript = null;
+    updatePipeline();
+    log("文件内容尚未译为目标语言，按原文处理。");
+    return { kind: "original", pages: state.pages.length };
+  }
+  return {
+    kind: state.importMode === "bilingual" ? "bilingual" : "translated",
+    pages: state.pages.length,
+    translated: state.pages.filter((p) => p.translated).length,
+  };
+}
+async function retryFailedPages() {
+  const byStage = { parse: [], translate: [], proof: [] };
+  state.pages.forEach((p, i) => p.error && byStage[p.errorStage]?.push(i));
+  const fns = { parse: parsePage, translate: translatePage, proof: proofPage };
+  const labels = { parse: "解析", translate: "翻译", proof: "校对" };
+  for (const stage of ["parse", "translate", "proof"])
+    if (byStage[stage].length) {
+      const r = await runPages(stage, labels[stage], byStage[stage], (i) =>
+        fns[stage](i),
+      );
+      if (r.paused) return r;
+    }
+  return { paused: false };
+}
+// 完整处理当前文件：解析（含清洗）→ 翻译 → 校对 → 书稿重建。出错页自动重试一次。
+async function engineRun() {
+  syncEditors();
+  setBusy(true);
+  let paused = false;
+  try {
+    if (state.pdf) paused = (await stageParse()).paused;
+    if (!paused) paused = (await stageTranslate()).paused;
+    // 导入的已有译文直接进入书稿重建，不再重新校对
+    const imported = ["translated", "bilingual"].includes(state.importMode);
+    if (!paused && $("proofEnabled").checked && !imported)
+      paused = (await stageProof()).paused;
+    if (!paused && state.pages.some((p) => p.error)) {
+      log("自动重试出错页。");
+      paused = (await retryFailedPages()).paused;
+    }
+  } finally {
+    setBusy(false);
+  }
+  if (paused) return { paused: true };
+  const errorPages = state.pages.filter((p) => p.error).map((p) => p.n);
+  const hasTarget = state.pages.some((p) => p.target && p.target.trim());
+  let manuscriptError = "";
+  if ($("batchManuscript").checked && hasTarget) {
+    try {
+      await reconstructBook(true);
+    } catch (e) {
+      if (isFatalError(e)) throw e;
+      manuscriptError = e.message;
+      log("书稿重建失败：" + e.message);
+    }
+  }
+  return {
+    paused: false,
+    pages: state.pages.length,
+    errorPages,
+    hasTarget,
+    manuscriptError,
+    blocks: state.manuscript?.blocks?.length || 0,
+  };
+}
+// 由本地服务写出书稿 Word、对照 Word 和项目 JSON
+async function engineExport(outId, rel) {
+  const wantManuscript =
+      $("batchManuscript").checked && !!state.manuscript?.blocks?.length,
+    // 书稿未能生成时退而保存对照稿，保证每个文件都有可读的译文
+    wantBilingual =
+      $("batchBilingual").checked ||
+      ($("batchManuscript").checked && !wantManuscript),
+    hasTarget = state.pages.some((p) => p.target && p.target.trim());
+  const body = {
+    out_id: outId,
+    rel,
+    manuscript: wantManuscript && hasTarget ? docxPayload("manuscript") : null,
+    bilingual: wantBilingual && hasTarget ? docxPayload("bilingual") : null,
+    project: projectObject(),
+  };
+  const r = await apiFetch("/api/output/export", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let data = {};
+  try {
+    data = await r.json();
+  } catch (e) {}
+  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  log(`已保存：${data.written.map((w) => w.path).join("、")}`);
+  return data;
+}
+const SETTING_IDS = {
+  source_lang: "sourceLang",
+  target_lang: "targetLang",
+  style: "style",
+  proof: "proofEnabled",
+  manuscript: "batchManuscript",
+  bilingual: "batchBilingual",
+  ocr: "ocrMode",
+  ocr_lang: "ocrLang",
+  footnote_numbering: "footnoteNumbering",
+};
+function optionText(id) {
+  const el = $(id);
+  return el.type === "checkbox" ? el.checked : el.selectedOptions?.[0]?.textContent || el.value;
+}
+function engineSettings() {
+  const out = {};
+  for (const [k, id] of Object.entries(SETTING_IDS)) {
+    const el = $(id);
+    out[k] = el.type === "checkbox" ? el.checked : el.value;
+  }
+  return {
+    ...out,
+    labels: Object.fromEntries(
+      Object.keys(SETTING_IDS).map((k) => [k, optionText(SETTING_IDS[k])]),
+    ),
+    glossary: $("glossary").value,
+    requirements: $("customPrompt").value,
+    provider: PROVIDER_LABELS[providerName()] || providerName(),
+    model: $("model").value,
+    keySaved: !!state.keySaved || !!$("apiKey").value.trim(),
+  };
+}
+// 应用对话中提出的设置，返回实际改动的项（中文说明）
+function engineApply({
+  settings = {},
+  glossary_add = [],
+  requirements = null,
+  requirements_mode = "append",
+} = {}) {
+  const changed = [];
+  for (const [k, v] of Object.entries(settings || {})) {
+    const id = SETTING_IDS[k];
+    if (!id) continue;
+    const el = $(id);
+    if (el.type === "checkbox") {
+      if (typeof v !== "boolean" || el.checked === v) continue;
+      el.checked = v;
+    } else {
+      if (![...el.options].some((o) => o.value === v) || el.value === v)
+        continue;
+      el.value = v;
+    }
+    changed.push(k);
+  }
+  const terms = (Array.isArray(glossary_add) ? glossary_add : [])
+    .map((x) => String(x || "").trim())
+    .filter((x) => /.=./.test(x));
+  if (terms.length) {
+    const lines = $("glossary").value.split("\n").filter((l) => l.trim());
+    for (const t of terms) {
+      const key = t.split("=")[0].trim().toLowerCase();
+      const i = lines.findIndex(
+        (l) => l.split("=")[0].trim().toLowerCase() === key,
+      );
+      if (i >= 0) lines[i] = t;
+      else lines.push(t);
+    }
+    $("glossary").value = lines.join("\n");
+    changed.push("glossary");
+  }
+  if (typeof requirements === "string") {
+    const cur = $("customPrompt").value.trim(),
+      add = requirements.trim();
+    let next = cur;
+    if (requirements_mode === "replace") next = add;
+    else if (add && !cur.includes(add)) next = cur ? cur + "\n" + add : add;
+    if (next !== cur) {
+      $("customPrompt").value = next;
+      changed.push("requirements");
+    }
+  }
+  if (changed.length) {
+    state.manuscript = null;
+    saveSettings();
+  }
+  return changed;
+}
+async function engineChat(text, context) {
+  return parseModelJson(await apiCall("chat", text, context));
+}
+export const engine = {
+  state,
+  loadFile: engineLoadFile,
+  run: engineRun,
+  export: engineExport,
+  pause() {
+    runner.pause = true;
+  },
+  settings: engineSettings,
+  apply: engineApply,
+  chat: engineChat,
+  isFatal: isFatalError,
+  openSettings,
+  refreshKeyStatus,
+  apiFetch,
+  onActivity(fn) {
+    activityListeners.add(fn);
+    return () => activityListeners.delete(fn);
+  },
+  runner,
+  showPage,
+};
+window.SPT.engine = engine;

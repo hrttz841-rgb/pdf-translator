@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PDF_TRANSLATOR_PORT", "8765"))
 APP_ID = "scholar-pdf-translator"
-APP_VERSION = "2.12.0"
+APP_VERSION = "2.13.0"
 # 每次启动随机生成的会话令牌。只注入到本服务提供的页面中，其他网站无法读取，
 # 因而无法冒用本地服务调用 AI 接口或管理已保存的 API Key。
 SESSION_TOKEN = secrets.token_urlsafe(32)
@@ -34,6 +34,7 @@ from docx_export import (  # noqa: F401
     reflow_blocks,
     _note_key,
 )
+import batch_io
 
 STATIC_MIME = {
     ".html": "text/html; charset=utf-8",
@@ -235,6 +236,50 @@ class Handler(BaseHTTPRequestHandler):
                 self.binary_response(
                     content,
                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+                return
+            # ---------- 对话式批量处理：读取文件夹、写出译文 ----------
+            if self.path == "/api/folder/list":
+                self.json_response(
+                    batch_io.list_folder(data.get("path"), data.get("outputs"))
+                )
+                return
+            if self.path == "/api/folder/read":
+                content = batch_io.read_folder_file(
+                    data.get("folder_id"), data.get("rel")
+                )
+                self.binary_response(content)
+                return
+            if self.path == "/api/output/prepare":
+                self.json_response(
+                    batch_io.prepare_output(
+                        data.get("name"), data.get("rels"), data.get("outputs")
+                    )
+                )
+                return
+            if self.path == "/api/output/status":
+                self.json_response(
+                    {
+                        "done": batch_io.done_rels(
+                            data.get("out_id"), data.get("rels"), data.get("outputs")
+                        )
+                    }
+                )
+                return
+            if self.path == "/api/output/export":
+                self.json_response(
+                    batch_io.export_outputs(
+                        data,
+                        build_manuscript_docx,
+                        lambda d: build_translation_docx(d, bilingual=True),
+                    )
+                )
+                return
+            if self.path == "/api/output/open":
+                self.json_response(
+                    batch_io.open_in_file_manager(
+                        data.get("out_id"), data.get("rel"), data.get("kind")
+                    )
                 )
                 return
             if self.path == "/api/manuscript-report":

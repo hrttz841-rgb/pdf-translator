@@ -341,7 +341,7 @@ def test_note_key_normalization():
 
 
 @pytest.mark.parametrize(
-    "task", ["translate", "proofread", "audit", "reconstruct", "ping"]
+    "task", ["translate", "proofread", "audit", "reconstruct", "ping", "chat"]
 )
 def test_every_frontend_task_has_a_system_prompt(task):
     p = server.system_prompt(
@@ -355,6 +355,36 @@ def test_every_frontend_task_has_a_system_prompt(task):
     assert p.strip()
     if task in ("translate", "proofread"):
         assert "国家能力" in p
+
+
+def test_chat_prompt_matches_frontend_contract():
+    p = server.system_prompt({"task": "chat"})
+    for key in (
+        '"reply"',
+        '"action"',
+        '"settings"',
+        '"glossary_add"',
+        '"requirements"',
+        "requirements_mode",
+    ):
+        assert key in p
+    for value in (
+        "source_lang",
+        "target_lang",
+        "style",
+        "proof",
+        "manuscript",
+        "bilingual",
+        "ocr_lang",
+        "footnote_numbering",
+        "open_output",
+        "retry",
+    ):
+        assert value in p
+    user = ai_client._user_prompt(
+        {"task": "chat", "text": "不要校对", "context": '{"queue": "空"}'}
+    )
+    assert user.startswith("当前状态") and user.endswith("不要校对")
 
 
 def test_reconstruct_prompt_matches_frontend_contract():
