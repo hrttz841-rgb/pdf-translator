@@ -3,14 +3,18 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Scholar PDF Translator v2.12.0</title>
+  <title>Scholar PDF Translator v2.13.0</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
-<body>
+<body data-mode="chat">
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true">译</span>
       <span class="brand-name">Scholar PDF Translator</span>
+    </div>
+    <div class="mode-switch" role="tablist" aria-label="界面">
+      <button id="modeChat" class="mode-btn active" role="tab" aria-selected="true">对话</button>
+      <button id="modeWork" class="mode-btn" role="tab" aria-selected="false">工作台</button>
     </div>
     <div class="doc-title" id="docTitle">尚未打开文档</div>
     <div class="topbar-actions">
@@ -18,6 +22,27 @@
       <button id="settingsBtn" class="btn quiet">设置</button>
     </div>
   </header>
+
+  <section id="chatView" class="chat-view" aria-label="对话">
+    <div id="chatScroll" class="chat-scroll">
+      <div id="chatThread" class="chat-thread" aria-live="polite"></div>
+    </div>
+    <div class="chat-dock">
+      <div id="chatSettings" class="chat-settings" aria-label="当前设置"></div>
+      <form id="composer" class="composer">
+        <textarea id="chatInput" rows="1" placeholder="把文件夹拖进来，或粘贴文件夹路径；翻译要求也可以直接说" aria-label="消息"></textarea>
+        <div class="composer-row">
+          <button type="button" id="pickFolder" class="btn small">选择文件夹</button>
+          <button type="button" id="pickFiles" class="btn small quiet">选择文件</button>
+          <span class="composer-hint">Enter 发送，Shift + Enter 换行</span>
+          <button type="submit" id="chatSend" class="btn primary small">发送</button>
+        </div>
+        <input id="folderInput" type="file" webkitdirectory multiple hidden />
+        <input id="filesInput" type="file" multiple accept=".pdf,.docx,.html,.htm,.json" hidden />
+      </form>
+    </div>
+    <div class="chat-drop" aria-hidden="true"><div class="chat-drop-inner">松开即可开始翻译</div></div>
+  </section>
 
   <div class="app">
     <aside class="sidebar">
@@ -369,6 +394,11 @@
           <label><input id="proofEnabled" type="checkbox" checked />完整处理时，翻译后自动校对</label>
           <label><input id="trueFootnotes" type="checkbox" checked />注释转为 Word 页下注（包括原书的章末注和书末注）</label>
         </div>
+        <div class="checks">
+          <span class="checks-title">对话模式批量处理时保存</span>
+          <label><input id="batchManuscript" type="checkbox" checked />中文书稿 Word</label>
+          <label><input id="batchBilingual" type="checkbox" />原文译文对照 Word</label>
+        </div>
         <div class="field">
           <label for="footnoteNumbering">页下注编号</label>
           <select id="footnoteNumbering">
@@ -440,5 +470,6 @@
       document.write('<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"><\/script>');
   </script>
   <script type="module" src="app.js"></script>
+  <script type="module" src="chat.js"></script>
 </body>
 </html>

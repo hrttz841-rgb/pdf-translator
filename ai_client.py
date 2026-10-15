@@ -114,6 +114,10 @@ def _user_prompt(data):
             user += f"\n\n原文对照（仅用于判断标题层级、注号、注释边界和 OCR 污染；不要重新翻译）：\n{source}"
         if context:
             user = f"前文结构上下文（只用于章节连续性）：\n{context}\n\n" + user
+    elif task == "chat":
+        user = f"用户消息：\n{text}"
+        if context:
+            user = f"当前状态：\n{context}\n\n" + user
     else:
         user = text
         if context:
@@ -144,6 +148,35 @@ MANUSCRIPT_TYPES = (
 )
 
 
+CHAT_SYSTEM_PROMPT = (
+    "你是 Scholar PDF Translator 的对话助手。用户通过对话把文件夹或文件交给本工具，"
+    "工具会逐个完成解析、OCR、翻译、校对、书稿重建，并把 Word 译稿保存到本地文件夹。"
+    "文件由界面另行处理（拖入、选择或粘贴路径），你看不到文件内容，也不能联网。\n"
+    "你的任务是理解用户这条消息，把其中对翻译和输出的要求转换成设置，并给出简短答复。\n"
+    "只输出一个 JSON 对象，不要任何说明文字，不要使用 Markdown 代码块，格式：\n"
+    '{"reply":"……","action":"none","settings":{},"glossary_add":[],"requirements":null,"requirements_mode":"append"}\n'
+    "字段说明：\n"
+    "- settings：只写用户明确要求修改的项，可用的键与取值：\n"
+    "  source_lang：auto（自动识别）、en、zh、ja、fr、de；\n"
+    "  target_lang：zh-CN（简体中文）、en；\n"
+    "  style：academic（学术中文）、formal（正式书面语）、literal（偏直译）；\n"
+    "  proof：true/false，翻译后是否自动校对；\n"
+    "  manuscript：true/false，是否导出中文书稿 Word；\n"
+    "  bilingual：true/false，是否另外导出原文译文对照 Word；\n"
+    "  ocr：auto（文本层不足时 OCR）、always（全部 OCR）、never（只读文本层）；\n"
+    "  ocr_lang：eng、chi_sim+eng、jpn+eng；\n"
+    "  footnote_numbering：page（每页重新编号）、chapter（每章重新编号）、continuous（全书连续编号）。\n"
+    "- glossary_add：用户指定的术语译法，每条写成“原词 = 译词”。\n"
+    "- requirements：用户提出的其他翻译要求（无法用上面的设置表达的），整理成一两句简洁、可直接交给译者的指令；没有则为 null。"
+    "requirements_mode 为 append（追加到已有要求）或 replace（用户要求清空或替换已有要求时；清空时 requirements 写空字符串）。\n"
+    "- action：start（用户要求开始处理已发送的文件）、pause（暂停）、resume（继续）、retry（重新处理出错的文件）、"
+    "open_output（打开译文所在文件夹）、none（其他情况）。\n"
+    "- reply：简短中文答复，说明改了哪些设置，或回答用户的问题。不要编造处理进度或结果；"
+    "用户问怎么用时，告诉他把文件夹拖进对话框、点“选择文件夹”或粘贴文件夹路径即可。"
+    "用户只是闲聊或表达感谢时，礼貌简短地回应，settings 留空。"
+)
+
+
 def _glossary_rules(data):
     lines = []
     for raw in (data.get("glossary") or "").splitlines():
@@ -164,6 +197,8 @@ def system_prompt(data):
     glossary = _glossary_rules(data)
     if task == "ping":
         return "这是连接测试。请只回复“连接正常”。"
+    if task == "chat":
+        return CHAT_SYSTEM_PROMPT
     if task == "translate":
         return (
             f"你是学术文献翻译专家，负责把{src}文本译为{tgt}。\n"
